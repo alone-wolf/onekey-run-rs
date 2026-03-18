@@ -1,0 +1,19 @@
+/target/
+
+# IDE
+/.idea/
+
+# Runtime state
+/.onekey-run/
+**/.onekey-run/
+
+# Local logs
+/logs/
+**/logs/
+*.log
+
+# Local verification / scratch
+/tmp-review-config/
+
+# OS
+.DS_Store

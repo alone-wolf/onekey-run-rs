@@ -1,0 +1,58 @@
+defaults:
+  stop_timeout_secs: 10
+  restart: "no"
+
+services:
+  app:
+    executable: "sh"
+    args:
+      - "-c"
+      - |
+        i=1
+        while true; do
+          echo "[app] heartbeat ${i}"
+          sleep 1
+          i=$((i + 1))
+        done
+    cwd: "."
+    env:
+      RUST_LOG: "info"
+    log:
+      file: "./logs/app.log"
+      append: true
+      max_file_bytes: 10485760
+      overflow_strategy: "rotate"
+      rotate_file_count: 5
+    depends_on: []
+    restart: "no"
+    stop_signal: "term"
+    stop_timeout_secs: 10
+    autostart: true
+    disabled: false
+
+  worker:
+    executable: "sh"
+    args:
+      - "-c"
+      - |
+        i=1
+        while true; do
+          echo "[worker] processing job ${i}"
+          echo "[worker] debug line ${i}" >&2
+          sleep 2
+          i=$((i + 1))
+        done
+    cwd: "."
+    env: {}
+    log:
+      file: "./logs/worker.log"
+      append: true
+      max_file_bytes: 10485760
+      overflow_strategy: "rotate"
+      rotate_file_count: 5
+    depends_on: ["app"]
+    restart: "on-failure"
+    stop_signal: "term"
+    stop_timeout_secs: 10
+    autostart: true
+    disabled: false
