@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod config;
 mod error;
+mod file_log;
 mod orchestrator;
 mod process;
 mod runtime_state;

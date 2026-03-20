@@ -30,7 +30,7 @@ src/
 - `error.rs`
   定义统一错误类型和退出码映射。
 - `config/`
-  负责配置加载、解析和校验。
+  负责配置加载、解析、校验，以及内置模板 preset / YAML render。
 - `orchestrator/`
   负责依赖图、状态机和全局编排流程。
 - `process/`
@@ -45,6 +45,8 @@ src/
 - `ProjectConfig`
 - `ServiceConfig`
 - `RestartPolicy`
+- `ActionConfig`
+- `LogConfig`
 - `ServiceState`
 - `RunPlan`
 - `RuntimeEvent`

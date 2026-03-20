@@ -24,6 +24,7 @@
 | `08_cross_platform_strategy.md` | 定义 Unix-like / Windows 的进程控制差异和实现策略 | draft |
 | `09_runtime_state_persistence.md` | 定义 `down` 命令依赖的 pid / state / lock 落盘规则 | draft |
 | `10_logging_design.md` | 定义日志文件写入、容量上限、rotate/archive 语义与命名规则 | draft |
+| `11_config_generator_tasks.md` | 将配置文件生成器设计拆成可直接编码的任务清单、文件改动点与验收标准 | draft |
 
 ## 规划阶段必须准备的文档
 

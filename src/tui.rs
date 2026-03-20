@@ -19,9 +19,10 @@ use ratatui::{Frame, Terminal};
 use crate::error::{AppError, AppResult};
 use crate::orchestrator::ShutdownController;
 use crate::process::{self, LogEvent, LogStream, SpawnedProcess};
-use crate::runtime_state;
+use crate::runtime_state::{self, RuntimeEvent};
 
 const MAX_LOG_LINES: usize = 500;
+const MAX_EVENTS: usize = 500;
 
 pub fn run_dashboard(
     project_root: &Path,
@@ -34,6 +35,7 @@ pub fn run_dashboard(
 
     let result = loop {
         state.drain_logs(&log_rx);
+        state.refresh_events(project_root);
 
         if shutdown.shutdown_requested() {
             state.set_notice("interrupt received, stopping services. press Ctrl-C again to force.");
@@ -79,6 +81,8 @@ pub fn run_dashboard(
 
 struct DashboardState {
     services: Vec<ServicePanel>,
+    events: VecDeque<RuntimeEvent>,
+    main_tab: DashboardTab,
     selected: usize,
     notice: String,
 }
@@ -88,6 +92,13 @@ struct ServicePanel {
     pid: u32,
     status: String,
     logs: VecDeque<String>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DashboardTab {
+    Overview,
+    Logs,
+    Events,
 }
 
 impl DashboardState {
@@ -104,9 +115,11 @@ impl DashboardState {
 
         Self {
             services,
+            events: VecDeque::new(),
+            main_tab: DashboardTab::Overview,
             selected: 0,
             notice:
-                "Left/Right or Tab switch service, 1-9 jump tab, q/Esc graceful stop, Ctrl-C twice force"
+                "Tab switch panel, Left/Right switch service, 1-9 jump service, q/Esc graceful stop"
                     .to_owned(),
         }
     }
@@ -144,6 +157,13 @@ impl DashboardState {
         }
     }
 
+    fn refresh_events(&mut self, project_root: &Path) {
+        if let Ok(events) = runtime_state::load_events(project_root) {
+            self.events = events.into_iter().rev().take(MAX_EVENTS).collect();
+            self.events.make_contiguous().reverse();
+        }
+    }
+
     fn handle_event(&mut self, event: Event, shutdown: &ShutdownController) -> bool {
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
@@ -161,7 +181,23 @@ impl DashboardState {
                     }
                     true
                 }
-                KeyCode::Left | KeyCode::BackTab => {
+                KeyCode::BackTab => {
+                    self.main_tab = match self.main_tab {
+                        DashboardTab::Overview => DashboardTab::Events,
+                        DashboardTab::Logs => DashboardTab::Overview,
+                        DashboardTab::Events => DashboardTab::Logs,
+                    };
+                    false
+                }
+                KeyCode::Tab => {
+                    self.main_tab = match self.main_tab {
+                        DashboardTab::Overview => DashboardTab::Logs,
+                        DashboardTab::Logs => DashboardTab::Events,
+                        DashboardTab::Events => DashboardTab::Overview,
+                    };
+                    false
+                }
+                KeyCode::Left => {
                     if !self.services.is_empty() {
                         if self.selected == 0 {
                             self.selected = self.services.len() - 1;
@@ -171,7 +207,7 @@ impl DashboardState {
                     }
                     false
                 }
-                KeyCode::Right | KeyCode::Tab => {
+                KeyCode::Right => {
                     if !self.services.is_empty() {
                         self.selected = (self.selected + 1) % self.services.len();
                     }
@@ -195,11 +231,31 @@ impl DashboardState {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3),
+                Constraint::Length(3),
                 Constraint::Length(7),
                 Constraint::Min(8),
                 Constraint::Length(2),
             ])
             .split(frame.area());
+
+        let main_titles = vec![
+            Line::from("Overview"),
+            Line::from("Logs"),
+            Line::from("Events"),
+        ];
+        let main_tabs = Tabs::new(main_titles)
+            .select(match self.main_tab {
+                DashboardTab::Overview => 0,
+                DashboardTab::Logs => 1,
+                DashboardTab::Events => 2,
+            })
+            .block(Block::default().borders(Borders::ALL).title("Panels"))
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            );
+        frame.render_widget(main_tabs, chunks[0]);
 
         let titles: Vec<Line<'_>> = self
             .services
@@ -214,7 +270,7 @@ impl DashboardState {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             );
-        frame.render_widget(tabs, chunks[0]);
+        frame.render_widget(tabs, chunks[1]);
 
         let summary_items: Vec<ListItem<'_>> = self
             .services
@@ -237,36 +293,100 @@ impl DashboardState {
             .collect();
         let summary =
             List::new(summary_items).block(Block::default().borders(Borders::ALL).title("Status"));
-        frame.render_widget(summary, chunks[1]);
+        frame.render_widget(summary, chunks[2]);
 
-        let log_lines = self
-            .services
-            .get(self.selected)
-            .map(|service| {
-                if service.logs.is_empty() {
-                    vec![Line::from("No logs captured yet.")]
-                } else {
-                    service
-                        .logs
-                        .iter()
-                        .cloned()
-                        .map(Line::from)
-                        .collect::<Vec<_>>()
-                }
-            })
-            .unwrap_or_else(|| vec![Line::from("No services started.")]);
-        let logs = Paragraph::new(log_lines)
-            .block(Block::default().borders(Borders::ALL).title("Logs"))
-            .wrap(Wrap { trim: false });
-        frame.render_widget(logs, chunks[2]);
+        match self.main_tab {
+            DashboardTab::Overview => {
+                let overview_lines = self
+                    .services
+                    .get(self.selected)
+                    .map(|service| {
+                        vec![
+                            Line::from(format!("service: {}", service.name)),
+                            Line::from(format!("pid: {}", service.pid)),
+                            Line::from(format!("status: {}", service.status)),
+                            Line::from(format!("captured logs: {}", service.logs.len())),
+                            Line::from(format!("captured events: {}", self.events.len())),
+                        ]
+                    })
+                    .unwrap_or_else(|| vec![Line::from("No services started.")]);
+                let overview = Paragraph::new(overview_lines)
+                    .block(Block::default().borders(Borders::ALL).title("Overview"))
+                    .wrap(Wrap { trim: false });
+                frame.render_widget(overview, chunks[3]);
+            }
+            DashboardTab::Logs => {
+                let log_lines = self
+                    .services
+                    .get(self.selected)
+                    .map(|service| {
+                        if service.logs.is_empty() {
+                            vec![Line::from("No logs captured yet.")]
+                        } else {
+                            service
+                                .logs
+                                .iter()
+                                .cloned()
+                                .map(Line::from)
+                                .collect::<Vec<_>>()
+                        }
+                    })
+                    .unwrap_or_else(|| vec![Line::from("No services started.")]);
+                let logs = Paragraph::new(log_lines)
+                    .block(Block::default().borders(Borders::ALL).title("Logs"))
+                    .wrap(Wrap { trim: false });
+                frame.render_widget(logs, chunks[3]);
+            }
+            DashboardTab::Events => {
+                let event_lines = self.render_event_lines();
+                let events = Paragraph::new(event_lines)
+                    .block(Block::default().borders(Borders::ALL).title("Events"))
+                    .wrap(Wrap { trim: false });
+                frame.render_widget(events, chunks[3]);
+            }
+        }
 
         let help = Paragraph::new(self.notice.as_str())
             .block(Block::default().borders(Borders::ALL).title("Keys"));
-        frame.render_widget(help, chunks[3]);
+        frame.render_widget(help, chunks[4]);
     }
 
     fn set_notice(&mut self, notice: impl Into<String>) {
         self.notice = notice.into();
+    }
+
+    fn render_event_lines(&self) -> Vec<Line<'_>> {
+        if self.events.is_empty() {
+            return vec![Line::from("No orchestrator events captured yet.")];
+        }
+
+        self.events
+            .iter()
+            .rev()
+            .take(MAX_EVENTS)
+            .map(|event| {
+                let color = if event.event_type.contains("failed") {
+                    Color::Red
+                } else if event.event_type.contains("timeout") {
+                    Color::Yellow
+                } else if event.event_type.contains("started") {
+                    Color::Blue
+                } else {
+                    Color::Green
+                };
+                let service = event.service_name.as_deref().unwrap_or("-");
+                let hook = event.hook_name.as_deref().unwrap_or("-");
+                let action = event.action_name.as_deref().unwrap_or("-");
+                Line::from(vec![
+                    Span::styled(
+                        format!("{:>10}", event.event_type),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(format!(" | svc={} | hook={} | action={} | ", service, hook, action)),
+                    Span::raw(event.detail.clone()),
+                ])
+            })
+            .collect()
     }
 }
 

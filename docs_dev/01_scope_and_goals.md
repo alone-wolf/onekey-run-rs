@@ -53,9 +53,13 @@
 - 首版不做配置 `version` 字段
 - 首版不做健康检查和业务级 ready，仅以进程是否仍然存活为基础状态语义
 - 平台目标为同时支持 Unix-like 和 Windows，但是否一次性交付需要单独评估
+- 后续扩展会在 `services` 之外引入顶层 `actions`，并允许 `service.hooks` 引用它们
+- 当前阶段先明确 `before_start` 为阻断型 hook：其 actions 同步串行执行，任一 action 失败会取消后续 action，并阻止当前 service 以及依赖它的后续 services 启动
+- action 失败、hook 中断等异常需要进入日志记录链路；现阶段先保留接口，待后续补齐 `onekey-run-rs` 本体日志能力
+- 不同 hook 会向 action 提供不同的上下文变量，允许在 `args` 等字符串字段中使用 `${service_name}`、`${action_name}`、`${service_cwd}` 这类占位符
 
 ## 7. 待确认问题
 
 - Windows 首版是否和 Unix-like 完全同等能力，还是采用分阶段支持
 - `up` 是否默认支持仅启动部分服务及其依赖
-- 服务是否允许配置 prestart / poststop hooks
+- 各 hook 可用的上下文变量集合，以及占位符替换的精确规则，仍需在设计文档中细化

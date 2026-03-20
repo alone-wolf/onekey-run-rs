@@ -1,58 +1,93 @@
 defaults:
   stop_timeout_secs: 10
-  restart: "no"
-
+  restart: no
+log:
+  file: ./logs/onekey-run.log
+  append: true
+  max_file_bytes: 10485760
+  overflow_strategy: rotate
+  rotate_file_count: 5
+actions:
+  notify-exit:
+    executable: sh
+    args:
+    - -c
+    - echo ${service_name} exited unexpectedly with ${exit_status}
+    cwd: .
+    timeout_secs: 10
+    disabled: false
+  notify-stop:
+    executable: sh
+    args:
+    - -c
+    - echo stopping ${service_name} because ${stop_reason}
+    cwd: .
+    timeout_secs: 10
+    disabled: false
+  notify-up:
+    executable: sh
+    args:
+    - -c
+    - echo ${service_name} started with pid ${service_pid}
+    cwd: .
+    timeout_secs: 10
+    disabled: false
+  prepare-app:
+    executable: sh
+    args:
+    - -c
+    - echo preparing ${service_name} in ${service_cwd}
+    cwd: .
+    timeout_secs: 10
+    disabled: false
 services:
   app:
-    executable: "sh"
+    executable: sleep
     args:
-      - "-c"
-      - |
-        i=1
-        while true; do
-          echo "[app] heartbeat ${i}"
-          sleep 1
-          i=$((i + 1))
-        done
-    cwd: "."
+    - '30'
+    cwd: .
     env:
-      RUST_LOG: "info"
-    log:
-      file: "./logs/app.log"
-      append: true
-      max_file_bytes: 10485760
-      overflow_strategy: "rotate"
-      rotate_file_count: 5
-    depends_on: []
-    restart: "no"
-    stop_signal: "term"
+      RUST_LOG: info
+    restart: no
+    stop_signal: term
     stop_timeout_secs: 10
     autostart: true
     disabled: false
-
+    log:
+      file: ./logs/app.log
+      append: true
+      max_file_bytes: 10485760
+      overflow_strategy: rotate
+      rotate_file_count: 5
+    hooks:
+      before_start:
+      - prepare-app
+      after_start_success:
+      - notify-up
+      before_stop:
+      - notify-stop
+      after_runtime_exit_unexpected:
+      - notify-exit
   worker:
-    executable: "sh"
+    executable: sleep
     args:
-      - "-c"
-      - |
-        i=1
-        while true; do
-          echo "[worker] processing job ${i}"
-          echo "[worker] debug line ${i}" >&2
-          sleep 2
-          i=$((i + 1))
-        done
-    cwd: "."
-    env: {}
-    log:
-      file: "./logs/worker.log"
-      append: true
-      max_file_bytes: 10485760
-      overflow_strategy: "rotate"
-      rotate_file_count: 5
-    depends_on: ["app"]
-    restart: "on-failure"
-    stop_signal: "term"
+    - '30'
+    cwd: .
+    depends_on:
+    - app
+    restart: on-failure
+    stop_signal: term
     stop_timeout_secs: 10
     autostart: true
     disabled: false
+    log:
+      file: ./logs/worker.log
+      append: true
+      max_file_bytes: 10485760
+      overflow_strategy: rotate
+      rotate_file_count: 5
+    hooks:
+      before_start:
+      - prepare-app
+      after_runtime_exit_unexpected:
+      - notify-exit

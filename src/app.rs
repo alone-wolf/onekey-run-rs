@@ -212,7 +212,7 @@ mod tests {
         let canonical_project_root = project_root.canonicalize().unwrap();
         let canonical_config_path = config_path.canonicalize().unwrap();
 
-        let state = RuntimeState::new(canonical_project_root.clone(), canonical_config_path);
+        let state = RuntimeState::new(canonical_project_root.clone(), canonical_config_path, None);
         runtime_state::write_state(&canonical_project_root, &state).unwrap();
 
         let original_dir = env::current_dir().unwrap();
