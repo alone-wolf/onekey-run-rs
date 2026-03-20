@@ -622,7 +622,7 @@ impl ProjectConfig {
         for (name, service) in &self.services {
             if !is_valid_service_name(name) {
                 errors.push(format!(
-                    "service name `{name}` is invalid; use lowercase letters, digits, or `-`"
+                    "service name `{name}` is invalid; use lowercase letters, digits, `_`, or `-`"
                 ));
             }
 
@@ -1011,7 +1011,7 @@ fn is_valid_service_name(name: &str) -> bool {
     !name.is_empty()
         && name
             .chars()
-            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_')
 }
 
 fn is_valid_action_name(name: &str) -> bool {
@@ -1391,6 +1391,18 @@ services:
         let config: ProjectConfig = serde_yaml::from_str(raw).unwrap();
         let error = config.validate("onekey-tasks.yaml".as_ref()).unwrap_err();
         assert!(error.to_string().contains("unknown placeholder"));
+    }
+
+    #[test]
+    fn accepts_service_names_with_underscore() {
+        let raw = r#"
+services:
+  api_server:
+    executable: "sleep"
+"#;
+
+        let config: ProjectConfig = serde_yaml::from_str(raw).unwrap();
+        config.validate("onekey-tasks.yaml".as_ref()).unwrap();
     }
 
     #[test]

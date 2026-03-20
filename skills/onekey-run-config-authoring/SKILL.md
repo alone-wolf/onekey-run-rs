@@ -164,7 +164,7 @@ services:                          # required, must be non-empty
 - Commands must be expressed as `executable` + `args`
 - `command` is not a supported field
 - `services` must not be empty
-- service names must use only lowercase letters, digits, or `-`
+- service names must use only lowercase letters, digits, `_`, or `-`
 - action names must start with an ASCII letter or digit, then use only ASCII letters, digits, `-`, or `_`
 - `executable` must not be empty
 - relative `cwd` is resolved relative to the config file directory

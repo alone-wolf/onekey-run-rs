@@ -161,7 +161,7 @@ services:
 - `services` 不能为空
 - `actions` 中被引用的 action 必须存在
 - 被 hook 引用的 action 不能是 `disabled: true`
-- 服务名必须唯一，且仅允许稳定字符集
+- 服务名必须唯一，且仅允许小写字母、数字、`_`、`-`
 - action 名必须唯一，且仅允许稳定字符集
 - `executable` 不允许为空字符串
 - `depends_on` 中的服务必须存在

@@ -23,3 +23,4 @@
 | `08_tui_events_panel_design.md` | 规划 `--tui` 中新增 Events 面板，用于展示 orchestrator 生命周期事件 | draft |
 | `07_instance_log_top_level_design.md` | 规划 `onekey-tasks.yaml` 顶层 `log`，用于记录 onekey-run 实例生命周期日志并复用现有 rotate/archive 逻辑 | draft |
 | `09_config_generator_design.md` | 规划配置文件生成器的建模、YAML 输出链路与分阶段实施方案，明确采用单一配置 schema + builder 的设计 | draft |
+| `10_config_naming_strict_policy_design.md` | 规划高于当前 `check` 的严格命名规范，并将其设计成配置文件可选优化能力 | draft |
