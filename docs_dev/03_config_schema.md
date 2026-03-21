@@ -50,8 +50,11 @@ services:
 
 - 顶层 `actions`
 - `service.hooks`
+- `services.<name>.watch`
 - `before_start` hook 的同步串行执行
 - `args` 中的基础占位符校验与渲染
+- `run --action` 对同一套占位符提供 standalone 执行上下文
+- 执行任何 action 前，先展示本次实际使用到的参数值
 - `init` / `init --full` 通过 preset builder 按当前运行平台生成对应模板
 
 ## 4. 服务字段建议
@@ -66,6 +69,8 @@ services:
   可选，环境变量键值对。
 - `log`
   可选，日志配置。当前阶段仅支持保存到文件。
+- `watch`
+  可选，service 级文件监控配置。用于在文件或目录变化后重启当前 service。
 - `depends_on`
   可选，依赖服务列表。
 - `restart`
@@ -113,6 +118,7 @@ services:
   必填，可执行文件名或可执行文件路径。
 - `args`
   可选，参数数组。当前已实现 `${service_name}`、`${action_name}`、`${service_cwd}` 等占位符的校验与渲染框架。
+  同一套 `args` 既可被 `service.hooks` 触发执行，也可由 `run --action` 直接执行。
 - `cwd`
   可选，action 独立工作目录。相对路径按 `onekey-tasks.yaml` 所在目录解析。
 - `env`
@@ -146,11 +152,43 @@ services:
 - `after_stop_failure`
 - `after_runtime_exit_unexpected`
 
-## 4.3 内部事件输出
+## 4.3 `watch` 子结构
 
-当前运行时会将 hooks / actions / service 生命周期事件写入：
+当前已实现的 `watch` 形状：
+
+```yaml
+services:
+  api:
+    executable: "cargo"
+    args: ["run"]
+    watch:
+      paths:
+        - "./src"
+        - "./Cargo.toml"
+      debounce_ms: 500
+```
+
+字段说明：
+
+- `paths`
+  必填，非空数组；每一项可为文件或目录，相对路径按 `onekey-tasks.yaml` 所在目录解析。
+- `debounce_ms`
+  可选，防抖窗口，单位为毫秒；当前默认值为 `500`，且必须大于 `0`。
+
+当前实现约定：
+
+- 目录默认递归监控
+- watch 只重启当前 service，不联动其他 service
+- watch 重启会复用现有 stop/start hooks
+- watch 会自动忽略 `.onekey-run/`、顶层实例日志和 `service.log`，避免自触发循环
+
+## 4.4 内部事件输出
+
+当前运行时会将 hooks / actions / watch / service 生命周期事件写入：
 
 - `.onekey-run/events.jsonl`
+
+若 action 运行在实例管理链路内，当前也会额外写入一条 `action_params_resolved` 摘要事件，用于记录执行前已解析的参数值。
 
 该文件当前主要作为内部事件通道，供后续本体日志、TUI 或管理面复用；普通 `up` 不会直接把这些事件刷到终端。
 
@@ -168,9 +206,13 @@ services:
 - 依赖图不能有环
 - `disabled` 服务是否允许被依赖，需要明确
 - 若配置 `log.file`，其值不允许为空
+- `watch.paths` 若存在必须为非空数组
+- `watch.paths[*]` 解析后必须存在，且必须是文件或目录
+- `watch.debounce_ms` 若出现必须大于 `0`
 - action `timeout_secs` 若出现必须大于 `0`
 - action `args` 中的占位符必须是受支持集合
 - 某个 hook 中引用 action 时，占位符必须对该 hook 可用
+- `run --action --arg key=value` 中的 key 必须属于受支持占位符集合
 
 ## 5.1 `log` 子结构
 
@@ -215,6 +257,50 @@ log:
 - `log.file` 不得与任何 `service.log.file` 解析到同一绝对路径
 - 实例日志文本应记录 hook/action 状态摘要，供人工排查
 - 机器可读聚合仍优先使用 `.onekey-run/events.jsonl`
+
+## 5.2 standalone action 默认上下文
+
+当用户执行：
+
+```bash
+onekey-run run --action <action_name>
+```
+
+运行时会为 action 补齐一套默认上下文，供 `${...}` 渲染使用。当前实现约定：
+
+- `project_root`
+  默认是配置文件所在目录
+- `config_path`
+  默认是配置文件绝对路径
+- `action_name`
+  默认是当前 action 名
+- `hook_name`
+  默认是 `manual`
+- `service_name`
+  默认是 `manual`
+- `service_cwd`
+  默认是配置文件所在目录
+- `service_executable`
+  默认是空字符串
+- `service_pid`
+  默认是空字符串
+- `stop_reason`
+  默认是 `manual`
+- `exit_code`
+  默认是空字符串
+- `exit_status`
+  默认是 `manual`
+
+若用户通过 `--arg service_name=<name>` 指定了一个已存在的 service，运行时会进一步推导：
+
+- `service_cwd`
+- `service_executable`
+
+但不会自动推导：
+
+- `service_pid`
+- `exit_code`
+- `exit_status`
 
 ## 6. 默认值策略
 

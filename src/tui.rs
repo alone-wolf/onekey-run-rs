@@ -10,43 +10,58 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Wrap};
 use ratatui::{Frame, Terminal};
 
 use crate::error::{AppError, AppResult};
-use crate::orchestrator::ShutdownController;
+use crate::orchestrator::{RunPlan, RuntimeOutputContext, ShutdownController, WatchRuntime};
 use crate::process::{self, LogEvent, LogStream, SpawnedProcess};
-use crate::runtime_state::{self, RuntimeEvent};
+use crate::runtime_state::{self, RuntimeEvent, RuntimeState};
 
 const MAX_LOG_LINES: usize = 500;
 const MAX_EVENTS: usize = 500;
 
 pub fn run_dashboard(
-    project_root: &Path,
-    running: &mut [SpawnedProcess],
+    plan: &RunPlan,
+    running: &mut Vec<SpawnedProcess>,
+    runtime_state: &mut RuntimeState,
+    watch_runtime: Option<&mut WatchRuntime>,
     log_rx: Receiver<LogEvent>,
     shutdown: ShutdownController,
+    output_context: &RuntimeOutputContext,
 ) -> AppResult<()> {
     let mut terminal = TerminalSession::enter()?;
-    let mut state = DashboardState::new(running);
+    let mut state = DashboardState::new(&plan.services, running);
+    let mut watch_runtime = watch_runtime;
 
     let result = loop {
+        state.sync_running(&plan.services, running);
         state.drain_logs(&log_rx);
-        state.refresh_events(project_root);
+        state.refresh_events(&plan.project_root);
 
         if shutdown.shutdown_requested() {
             state.set_notice("interrupt received, stopping services. press Ctrl-C again to force.");
             break Ok(());
         }
 
+        if let Some(watch_runtime) = watch_runtime.as_mut() {
+            watch_runtime.tick(plan, running, runtime_state, &shutdown, output_context)?;
+            state.sync_running(&plan.services, running);
+        }
+
         let mut exit_result = None;
         for process in running.iter_mut() {
             if let Some(status) = process::service_exited(&mut process.child)? {
-                state.mark_exited(&process.state.service_name, format!("Exited ({status})"));
-                if !runtime_state::state_path(project_root).exists() {
+                let graceful = !runtime_state::state_path(&plan.project_root).exists();
+                state.mark_exited(
+                    &process.state.service_name,
+                    format!("exit status {status}"),
+                    graceful,
+                );
+                if graceful {
                     exit_result = Some(Ok(()));
                 } else {
                     exit_result = Some(Err(AppError::runtime_failed(format!(
@@ -84,14 +99,24 @@ struct DashboardState {
     events: VecDeque<RuntimeEvent>,
     main_tab: DashboardTab,
     selected: usize,
+    log_scroll: usize,
+    event_scroll: usize,
     notice: String,
 }
 
 struct ServicePanel {
     name: String,
     pid: u32,
-    status: String,
+    watching: bool,
+    status: ServiceStatus,
+    last_watch_event: Option<String>,
     logs: VecDeque<String>,
+}
+
+enum ServiceStatus {
+    Running,
+    Stopped(String),
+    Failed(String),
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -102,14 +127,27 @@ enum DashboardTab {
 }
 
 impl DashboardState {
-    fn new(running: &[SpawnedProcess]) -> Self {
-        let services = running
+    fn new(services: &[crate::config::ResolvedServiceConfig], running: &[SpawnedProcess]) -> Self {
+        let running_by_name = running
             .iter()
-            .map(|process| ServicePanel {
-                name: process.state.service_name.clone(),
-                pid: process.state.pid,
-                status: "Running".to_owned(),
-                logs: VecDeque::new(),
+            .map(|process| (process.state.service_name.as_str(), process))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let services = services
+            .iter()
+            .map(|service| {
+                let running = running_by_name.get(service.name.as_str());
+                ServicePanel {
+                    name: service.name.clone(),
+                    pid: running.map(|process| process.state.pid).unwrap_or(0),
+                    watching: service.watch.is_some(),
+                    status: if running.is_some() {
+                        ServiceStatus::Running
+                    } else {
+                        ServiceStatus::Stopped("not running".to_owned())
+                    },
+                    last_watch_event: None,
+                    logs: VecDeque::new(),
+                }
             })
             .collect();
 
@@ -118,9 +156,38 @@ impl DashboardState {
             events: VecDeque::new(),
             main_tab: DashboardTab::Overview,
             selected: 0,
-            notice:
-                "Tab switch panel, Left/Right switch service, 1-9 jump service, q/Esc graceful stop"
-                    .to_owned(),
+            log_scroll: 0,
+            event_scroll: 0,
+            notice: "Up/Down select service | Left/Right/Tab switch panel | j/k or PgUp/PgDn scroll | Home/End jump | q/Esc stop".to_owned(),
+        }
+    }
+
+    fn sync_running(
+        &mut self,
+        services: &[crate::config::ResolvedServiceConfig],
+        running: &[SpawnedProcess],
+    ) {
+        let running_by_name = running
+            .iter()
+            .map(|process| (process.state.service_name.as_str(), process))
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        for service in services {
+            let Some(panel) = self
+                .services
+                .iter_mut()
+                .find(|panel| panel.name == service.name)
+            else {
+                continue;
+            };
+
+            if let Some(process) = running_by_name.get(service.name.as_str()) {
+                panel.pid = process.state.pid;
+                panel.status = ServiceStatus::Running;
+            } else if matches!(panel.status, ServiceStatus::Running) {
+                panel.pid = 0;
+                panel.status = ServiceStatus::Stopped("not running".to_owned());
+            }
         }
     }
 
@@ -131,6 +198,7 @@ impl DashboardState {
     }
 
     fn push_log(&mut self, event: LogEvent) {
+        let selected_name = self.selected_service_name().to_owned();
         if let Some(panel) = self
             .services
             .iter_mut()
@@ -144,16 +212,23 @@ impl DashboardState {
             while panel.logs.len() > MAX_LOG_LINES {
                 panel.logs.pop_front();
             }
+            if panel.name == selected_name && self.log_scroll > 0 {
+                self.log_scroll = self.log_scroll.saturating_add(1);
+            }
         }
     }
 
-    fn mark_exited(&mut self, service_name: &str, status: String) {
+    fn mark_exited(&mut self, service_name: &str, detail: String, graceful: bool) {
         if let Some(panel) = self
             .services
             .iter_mut()
             .find(|panel| panel.name == service_name)
         {
-            panel.status = status;
+            panel.status = if graceful {
+                ServiceStatus::Stopped(detail)
+            } else {
+                ServiceStatus::Failed(detail)
+            };
         }
     }
 
@@ -161,6 +236,21 @@ impl DashboardState {
         if let Ok(events) = runtime_state::load_events(project_root) {
             self.events = events.into_iter().rev().take(MAX_EVENTS).collect();
             self.events.make_contiguous().reverse();
+            self.refresh_watch_summaries();
+        }
+    }
+
+    fn refresh_watch_summaries(&mut self) {
+        for panel in &mut self.services {
+            panel.last_watch_event = self
+                .events
+                .iter()
+                .rev()
+                .find(|event| {
+                    event.service_name.as_deref() == Some(panel.name.as_str())
+                        && event.event_type.starts_with("watch_")
+                })
+                .map(|event| format!("{} | {}", event.event_type, event.detail));
         }
     }
 
@@ -182,41 +272,54 @@ impl DashboardState {
                     true
                 }
                 KeyCode::BackTab => {
-                    self.main_tab = match self.main_tab {
-                        DashboardTab::Overview => DashboardTab::Events,
-                        DashboardTab::Logs => DashboardTab::Overview,
-                        DashboardTab::Events => DashboardTab::Logs,
-                    };
+                    self.select_previous_tab();
                     false
                 }
-                KeyCode::Tab => {
-                    self.main_tab = match self.main_tab {
-                        DashboardTab::Overview => DashboardTab::Logs,
-                        DashboardTab::Logs => DashboardTab::Events,
-                        DashboardTab::Events => DashboardTab::Overview,
-                    };
+                KeyCode::Tab | KeyCode::Right => {
+                    self.select_next_tab();
                     false
                 }
                 KeyCode::Left => {
-                    if !self.services.is_empty() {
-                        if self.selected == 0 {
-                            self.selected = self.services.len() - 1;
-                        } else {
-                            self.selected -= 1;
-                        }
-                    }
+                    self.select_previous_tab();
                     false
                 }
-                KeyCode::Right => {
-                    if !self.services.is_empty() {
-                        self.selected = (self.selected + 1) % self.services.len();
-                    }
+                KeyCode::Up => {
+                    self.select_previous_service();
+                    false
+                }
+                KeyCode::Down => {
+                    self.select_next_service();
+                    false
+                }
+                KeyCode::PageUp => {
+                    self.scroll_current_panel_up(10);
+                    false
+                }
+                KeyCode::PageDown => {
+                    self.scroll_current_panel_down(10);
+                    false
+                }
+                KeyCode::Home => {
+                    self.scroll_current_panel_to_oldest();
+                    false
+                }
+                KeyCode::End => {
+                    self.scroll_current_panel_to_latest();
+                    false
+                }
+                KeyCode::Char('k') => {
+                    self.scroll_current_panel_up(1);
+                    false
+                }
+                KeyCode::Char('j') => {
+                    self.scroll_current_panel_down(1);
                     false
                 }
                 KeyCode::Char(ch) if ch.is_ascii_digit() => {
                     let index = ch.to_digit(10).unwrap_or(0) as usize;
                     if index > 0 && index <= self.services.len() {
                         self.selected = index - 1;
+                        self.log_scroll = 0;
                     }
                     false
                 }
@@ -231,12 +334,286 @@ impl DashboardState {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3),
+                Constraint::Min(12),
                 Constraint::Length(3),
-                Constraint::Length(7),
-                Constraint::Min(8),
-                Constraint::Length(2),
             ])
             .split(frame.area());
+
+        self.render_header(frame, chunks[0]);
+        self.render_body(frame, chunks[1]);
+
+        let footer = Paragraph::new(self.notice.as_str()).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Keys / Notice"),
+        );
+        frame.render_widget(footer, chunks[2]);
+    }
+
+    fn set_notice(&mut self, notice: impl Into<String>) {
+        self.notice = notice.into();
+    }
+
+    fn selected_service(&self) -> Option<&ServicePanel> {
+        self.services.get(self.selected)
+    }
+
+    fn selected_service_name(&self) -> &str {
+        self.selected_service()
+            .map(|service| service.name.as_str())
+            .unwrap_or("")
+    }
+
+    fn running_count(&self) -> usize {
+        self.services
+            .iter()
+            .filter(|service| matches!(service.status, ServiceStatus::Running))
+            .count()
+    }
+
+    fn watching_count(&self) -> usize {
+        self.services
+            .iter()
+            .filter(|service| service.watching)
+            .count()
+    }
+
+    fn select_previous_service(&mut self) {
+        if self.services.is_empty() {
+            return;
+        }
+        if self.selected == 0 {
+            self.selected = self.services.len() - 1;
+        } else {
+            self.selected -= 1;
+        }
+        self.log_scroll = 0;
+    }
+
+    fn select_next_service(&mut self) {
+        if self.services.is_empty() {
+            return;
+        }
+        self.selected = (self.selected + 1) % self.services.len();
+        self.log_scroll = 0;
+    }
+
+    fn select_previous_tab(&mut self) {
+        self.main_tab = match self.main_tab {
+            DashboardTab::Overview => DashboardTab::Events,
+            DashboardTab::Logs => DashboardTab::Overview,
+            DashboardTab::Events => DashboardTab::Logs,
+        };
+    }
+
+    fn select_next_tab(&mut self) {
+        self.main_tab = match self.main_tab {
+            DashboardTab::Overview => DashboardTab::Logs,
+            DashboardTab::Logs => DashboardTab::Events,
+            DashboardTab::Events => DashboardTab::Overview,
+        };
+    }
+
+    fn scroll_current_panel_up(&mut self, lines: usize) {
+        match self.main_tab {
+            DashboardTab::Logs => {
+                self.log_scroll = self.log_scroll.saturating_add(lines);
+            }
+            DashboardTab::Events => {
+                self.event_scroll = self.event_scroll.saturating_add(lines);
+            }
+            DashboardTab::Overview => {}
+        }
+    }
+
+    fn scroll_current_panel_down(&mut self, lines: usize) {
+        match self.main_tab {
+            DashboardTab::Logs => {
+                self.log_scroll = self.log_scroll.saturating_sub(lines);
+            }
+            DashboardTab::Events => {
+                self.event_scroll = self.event_scroll.saturating_sub(lines);
+            }
+            DashboardTab::Overview => {}
+        }
+    }
+
+    fn scroll_current_panel_to_oldest(&mut self) {
+        match self.main_tab {
+            DashboardTab::Logs => {
+                self.log_scroll = usize::MAX;
+            }
+            DashboardTab::Events => {
+                self.event_scroll = usize::MAX;
+            }
+            DashboardTab::Overview => {}
+        }
+    }
+
+    fn scroll_current_panel_to_latest(&mut self) {
+        match self.main_tab {
+            DashboardTab::Logs => {
+                self.log_scroll = 0;
+            }
+            DashboardTab::Events => {
+                self.event_scroll = 0;
+            }
+            DashboardTab::Overview => {}
+        }
+    }
+
+    fn render_header(&self, frame: &mut Frame<'_>, area: Rect) {
+        let selected = self
+            .selected_service()
+            .map(|service| service.name.as_str())
+            .unwrap_or("-");
+        let panel = match self.main_tab {
+            DashboardTab::Overview => "Overview",
+            DashboardTab::Logs => "Logs",
+            DashboardTab::Events => "Events",
+        };
+        let header = Paragraph::new(Line::from(vec![
+            Span::styled(
+                "onekey-run monitor",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                "  services {}/{} running",
+                self.running_count(),
+                self.services.len()
+            )),
+            Span::raw(format!("  watching {}", self.watching_count())),
+            Span::raw(format!("  selected {}", selected)),
+            Span::raw(format!("  panel {}", panel)),
+        ]))
+        .block(Block::default().borders(Borders::ALL).title("Dashboard"));
+        frame.render_widget(header, area);
+    }
+
+    fn render_body(&self, frame: &mut Frame<'_>, area: Rect) {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(36), Constraint::Min(20)])
+            .split(area);
+        self.render_sidebar(frame, columns[0]);
+        self.render_main_panel(frame, columns[1]);
+    }
+
+    fn render_sidebar(&self, frame: &mut Frame<'_>, area: Rect) {
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(8), Constraint::Length(8)])
+            .split(area);
+
+        let visible_service_count = ((sections[0].height.saturating_sub(2)) as usize / 2).max(1);
+        let (start, end) = self.service_window_bounds(visible_service_count);
+        let service_items: Vec<ListItem<'_>> = self
+            .services
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(end.saturating_sub(start))
+            .map(|(index, service)| {
+                let selected = index == self.selected;
+                let line = Line::from(vec![
+                    Span::styled(
+                        if selected { "> " } else { "  " },
+                        if selected {
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default()
+                        },
+                    ),
+                    Span::styled(
+                        service.name.clone(),
+                        if selected {
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().add_modifier(Modifier::BOLD)
+                        },
+                    ),
+                    Span::raw(if service.watching { "  watch on" } else { "" }),
+                    Span::raw(format!("  pid {}", service.pid)),
+                ]);
+                let status = Line::from(vec![
+                    Span::raw("   "),
+                    Span::styled(
+                        service.status.label(),
+                        Style::default()
+                            .fg(service.status.color())
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(format!("  logs {}", service.logs.len())),
+                ]);
+                ListItem::new(vec![line, status])
+            })
+            .collect();
+
+        let services = if service_items.is_empty() {
+            List::new(vec![ListItem::new(Line::from("No services started."))])
+        } else {
+            List::new(service_items)
+        }
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            "Services {}-{} / {}",
+            if self.services.is_empty() {
+                0
+            } else {
+                start + 1
+            },
+            end,
+            self.services.len()
+        )));
+        frame.render_widget(services, sections[0]);
+
+        let detail_lines = self
+            .selected_service()
+            .map(|service| {
+                let latest = service
+                    .logs
+                    .back()
+                    .cloned()
+                    .unwrap_or_else(|| "No logs captured yet.".to_owned());
+                vec![
+                    Line::from(format!("name: {}", service.name)),
+                    Line::from(format!("pid: {}", service.pid)),
+                    Line::from(format!("status: {}", service.status.label())),
+                    Line::from(format!("detail: {}", service.status.detail())),
+                    Line::from(format!(
+                        "watch: {}",
+                        if service.watching {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
+                    )),
+                    Line::from(format!(
+                        "last watch: {}",
+                        service.last_watch_event.as_deref().unwrap_or("none")
+                    )),
+                    Line::from(format!("logs: {}", service.logs.len())),
+                    Line::from("latest:"),
+                    Line::from(latest),
+                ]
+            })
+            .unwrap_or_else(|| vec![Line::from("No service selected.")]);
+        let detail = Paragraph::new(detail_lines)
+            .block(Block::default().borders(Borders::ALL).title("Selected"))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(detail, sections[1]);
+    }
+
+    fn render_main_panel(&self, frame: &mut Frame<'_>, area: Rect) {
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(8)])
+            .split(area);
 
         let main_titles = vec![
             Line::from("Overview"),
@@ -249,123 +626,141 @@ impl DashboardState {
                 DashboardTab::Logs => 1,
                 DashboardTab::Events => 2,
             })
-            .block(Block::default().borders(Borders::ALL).title("Panels"))
+            .block(Block::default().borders(Borders::ALL).title("Panel"))
             .highlight_style(
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             );
-        frame.render_widget(main_tabs, chunks[0]);
-
-        let titles: Vec<Line<'_>> = self
-            .services
-            .iter()
-            .map(|service| Line::from(service.name.clone()))
-            .collect();
-        let tabs = Tabs::new(titles)
-            .select(self.selected.min(self.services.len().saturating_sub(1)))
-            .block(Block::default().borders(Borders::ALL).title("Services"))
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            );
-        frame.render_widget(tabs, chunks[1]);
-
-        let summary_items: Vec<ListItem<'_>> = self
-            .services
-            .iter()
-            .map(|service| {
-                let status_color = if service.status == "Running" {
-                    Color::Green
-                } else {
-                    Color::Red
-                };
-                ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!("{:<16}", service.name),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(format!(" pid {:<7} ", service.pid)),
-                    Span::styled(service.status.clone(), Style::default().fg(status_color)),
-                ]))
-            })
-            .collect();
-        let summary =
-            List::new(summary_items).block(Block::default().borders(Borders::ALL).title("Status"));
-        frame.render_widget(summary, chunks[2]);
+        frame.render_widget(main_tabs, sections[0]);
 
         match self.main_tab {
-            DashboardTab::Overview => {
-                let overview_lines = self
-                    .services
-                    .get(self.selected)
-                    .map(|service| {
-                        vec![
-                            Line::from(format!("service: {}", service.name)),
-                            Line::from(format!("pid: {}", service.pid)),
-                            Line::from(format!("status: {}", service.status)),
-                            Line::from(format!("captured logs: {}", service.logs.len())),
-                            Line::from(format!("captured events: {}", self.events.len())),
-                        ]
-                    })
-                    .unwrap_or_else(|| vec![Line::from("No services started.")]);
-                let overview = Paragraph::new(overview_lines)
-                    .block(Block::default().borders(Borders::ALL).title("Overview"))
-                    .wrap(Wrap { trim: false });
-                frame.render_widget(overview, chunks[3]);
-            }
-            DashboardTab::Logs => {
-                let log_lines = self
-                    .services
-                    .get(self.selected)
-                    .map(|service| {
-                        if service.logs.is_empty() {
-                            vec![Line::from("No logs captured yet.")]
+            DashboardTab::Overview => self.render_overview_panel(frame, sections[1]),
+            DashboardTab::Logs => self.render_logs_panel(frame, sections[1]),
+            DashboardTab::Events => self.render_events_panel(frame, sections[1]),
+        }
+    }
+
+    fn render_overview_panel(&self, frame: &mut Frame<'_>, area: Rect) {
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(8), Constraint::Min(8)])
+            .split(area);
+        let lower = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(sections[1]);
+
+        let summary_lines = self
+            .selected_service()
+            .map(|service| {
+                vec![
+                    Line::from(format!("service: {}", service.name)),
+                    Line::from(format!("pid: {}", service.pid)),
+                    Line::from(format!("status: {}", service.status.label())),
+                    Line::from(format!("detail: {}", service.status.detail())),
+                    Line::from(format!(
+                        "watch: {}",
+                        if service.watching {
+                            "enabled"
                         } else {
-                            service
-                                .logs
-                                .iter()
-                                .cloned()
-                                .map(Line::from)
-                                .collect::<Vec<_>>()
+                            "disabled"
                         }
-                    })
-                    .unwrap_or_else(|| vec![Line::from("No services started.")]);
-                let logs = Paragraph::new(log_lines)
-                    .block(Block::default().borders(Borders::ALL).title("Logs"))
-                    .wrap(Wrap { trim: false });
-                frame.render_widget(logs, chunks[3]);
-            }
-            DashboardTab::Events => {
-                let event_lines = self.render_event_lines();
-                let events = Paragraph::new(event_lines)
-                    .block(Block::default().borders(Borders::ALL).title("Events"))
-                    .wrap(Wrap { trim: false });
-                frame.render_widget(events, chunks[3]);
-            }
+                    )),
+                    Line::from(format!(
+                        "last watch: {}",
+                        service.last_watch_event.as_deref().unwrap_or("none")
+                    )),
+                    Line::from(format!("captured logs: {}", service.logs.len())),
+                    Line::from(format!("captured events: {}", self.events.len())),
+                ]
+            })
+            .unwrap_or_else(|| vec![Line::from("No services started.")]);
+        let summary = Paragraph::new(summary_lines)
+            .block(Block::default().borders(Borders::ALL).title("Summary"))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(summary, sections[0]);
+
+        let log_preview = Paragraph::new(self.render_selected_log_lines(12, 0))
+            .block(Block::default().borders(Borders::ALL).title("Recent Logs"))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(log_preview, lower[0]);
+
+        let event_preview = Paragraph::new(self.render_event_lines(12, 0))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Recent Events"),
+            )
+            .wrap(Wrap { trim: false });
+        frame.render_widget(event_preview, lower[1]);
+    }
+
+    fn render_logs_panel(&self, frame: &mut Frame<'_>, area: Rect) {
+        let title = self
+            .selected_service()
+            .map(|service| {
+                if self.log_scroll == 0 {
+                    format!("Logs: {} (live)", service.name)
+                } else {
+                    format!("Logs: {} (scroll {} lines)", service.name, self.log_scroll)
+                }
+            })
+            .unwrap_or_else(|| "Logs".to_owned());
+        let visible_lines = area.height.saturating_sub(2) as usize;
+        let logs = Paragraph::new(self.render_selected_log_lines(visible_lines, self.log_scroll))
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(logs, area);
+    }
+
+    fn render_events_panel(&self, frame: &mut Frame<'_>, area: Rect) {
+        let title = if self.event_scroll == 0 {
+            "Events (latest)".to_owned()
+        } else {
+            format!("Events (scroll {} lines)", self.event_scroll)
+        };
+        let visible_lines = area.height.saturating_sub(2) as usize;
+        let events = Paragraph::new(self.render_event_lines(visible_lines, self.event_scroll))
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(events, area);
+    }
+
+    fn render_selected_log_lines(
+        &self,
+        visible_limit: usize,
+        scroll_from_bottom: usize,
+    ) -> Vec<Line<'_>> {
+        let Some(service) = self.selected_service() else {
+            return vec![Line::from("No services started.")];
+        };
+
+        if service.logs.is_empty() {
+            return vec![Line::from("No logs captured yet.")];
         }
 
-        let help = Paragraph::new(self.notice.as_str())
-            .block(Block::default().borders(Borders::ALL).title("Keys"));
-        frame.render_widget(help, chunks[4]);
+        let lines = service
+            .logs
+            .iter()
+            .cloned()
+            .map(Line::from)
+            .collect::<Vec<_>>();
+        self.window_lines(lines, visible_limit, scroll_from_bottom)
     }
 
-    fn set_notice(&mut self, notice: impl Into<String>) {
-        self.notice = notice.into();
-    }
-
-    fn render_event_lines(&self) -> Vec<Line<'_>> {
+    fn render_event_lines(&self, visible_limit: usize, scroll_from_bottom: usize) -> Vec<Line<'_>> {
         if self.events.is_empty() {
             return vec![Line::from("No orchestrator events captured yet.")];
         }
 
-        self.events
+        let lines = self
+            .events
             .iter()
-            .rev()
-            .take(MAX_EVENTS)
             .map(|event| {
-                let color = if event.event_type.contains("failed") {
+                let color = if event.event_type.starts_with("watch_") {
+                    Color::Magenta
+                } else if event.event_type.contains("failed") {
                     Color::Red
                 } else if event.event_type.contains("timeout") {
                     Color::Yellow
@@ -379,14 +774,78 @@ impl DashboardState {
                 let action = event.action_name.as_deref().unwrap_or("-");
                 Line::from(vec![
                     Span::styled(
-                        format!("{:>10}", event.event_type),
+                        format!("[{}] {}", event.timestamp_unix_secs, event.event_type),
                         Style::default().fg(color).add_modifier(Modifier::BOLD),
                     ),
-                    Span::raw(format!(" | svc={} | hook={} | action={} | ", service, hook, action)),
+                    Span::raw(format!("  svc={}  ", service)),
+                    Span::raw(format!("hook={}  action={}  ", hook, action)),
                     Span::raw(event.detail.clone()),
                 ])
             })
-            .collect()
+            .collect::<Vec<_>>();
+        self.window_lines(lines, visible_limit, scroll_from_bottom)
+    }
+
+    fn window_lines<'a>(
+        &self,
+        lines: Vec<Line<'a>>,
+        visible_limit: usize,
+        scroll_from_bottom: usize,
+    ) -> Vec<Line<'a>> {
+        if visible_limit == 0 {
+            return Vec::new();
+        }
+
+        if lines.len() <= visible_limit {
+            return lines;
+        }
+
+        let max_offset = lines.len().saturating_sub(visible_limit);
+        let offset = scroll_from_bottom.min(max_offset);
+        let end = lines.len().saturating_sub(offset);
+        let start = end.saturating_sub(visible_limit);
+        lines[start..end].to_vec()
+    }
+
+    fn service_window_bounds(&self, visible_count: usize) -> (usize, usize) {
+        if self.services.is_empty() {
+            return (0, 0);
+        }
+
+        if self.services.len() <= visible_count {
+            return (0, self.services.len());
+        }
+
+        let max_start = self.services.len().saturating_sub(visible_count);
+        let centered_start = self.selected.saturating_sub(visible_count / 2);
+        let start = centered_start.min(max_start);
+        let end = (start + visible_count).min(self.services.len());
+        (start, end)
+    }
+}
+
+impl ServiceStatus {
+    fn label(&self) -> &str {
+        match self {
+            Self::Running => "RUNNING",
+            Self::Stopped(_) => "STOPPED",
+            Self::Failed(_) => "FAILED",
+        }
+    }
+
+    fn detail(&self) -> &str {
+        match self {
+            Self::Running => "process is alive",
+            Self::Stopped(detail) | Self::Failed(detail) => detail.as_str(),
+        }
+    }
+
+    fn color(&self) -> Color {
+        match self {
+            Self::Running => Color::Green,
+            Self::Stopped(_) => Color::Yellow,
+            Self::Failed(_) => Color::Red,
+        }
     }
 }
 

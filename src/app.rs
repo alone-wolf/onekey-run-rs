@@ -18,6 +18,15 @@ pub fn run(cli: Cli) -> AppResult<()> {
             let plan = orchestrator::build_run_plan(&config, &cli.config, &[])?;
             orchestrator::run_check(&plan, &config)
         }
+        Command::List(args) => {
+            let config = ProjectConfig::load(&cli.config)?;
+            orchestrator::run_list(&cli.config, &config, args)
+        }
+        Command::Run(args) => {
+            let config = ProjectConfig::load(&cli.config)?;
+            let request = orchestrator::SingleRunRequest::from_args(args)?;
+            orchestrator::run_single(&cli.config, &config, request)
+        }
         Command::Management(ManagementArgs { watch, json }) => {
             orchestrator::run_management(watch, json)
         }
@@ -186,7 +195,7 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::cli::{Cli, Command, DownArgs};
+    use crate::cli::{Cli, Command, DownArgs, ListArgs, RunArgs};
     use crate::runtime_state::{self, RuntimeState};
 
     use super::{resolve_project_root_from_config, run};
@@ -256,6 +265,98 @@ mod tests {
         assert_eq!(resolved.unwrap(), project_root.canonicalize().unwrap());
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn list_command_loads_config_and_returns_ok() {
+        let dir = temp_dir("list-command");
+        let config_path = dir.join("onekey-tasks.yaml");
+
+        fs::write(
+            &config_path,
+            r#"
+actions:
+  notify:
+    executable: "echo"
+services:
+  api:
+    executable: "echo"
+"#,
+        )
+        .unwrap();
+
+        let result = run(Cli {
+            config: config_path,
+            verbose: false,
+            quiet: false,
+            no_color: false,
+            command: Command::List(ListArgs {
+                all: false,
+                services: false,
+                actions: false,
+                detail: false,
+                dag: false,
+            }),
+        });
+
+        assert!(result.is_ok(), "{result:?}");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn run_action_command_loads_config_and_returns_ok() {
+        let dir = temp_dir("run-action-command");
+        let config_path = dir.join("onekey-tasks.yaml");
+
+        fs::write(&config_path, success_run_action_config()).unwrap();
+
+        let result = run(Cli {
+            config: config_path,
+            verbose: false,
+            quiet: false,
+            no_color: false,
+            command: Command::Run(RunArgs {
+                service: None,
+                action: Some("prepare".to_owned()),
+                with_all_hooks: false,
+                without_hooks: false,
+                hook: Vec::new(),
+                args: Vec::new(),
+            }),
+        });
+
+        assert!(result.is_ok(), "{result:?}");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    fn success_run_action_config() -> &'static str {
+        r#"
+actions:
+  prepare:
+    executable: "sh"
+    args: ["-c", "exit 0"]
+services:
+  api:
+    executable: "sh"
+    args: ["-c", "sleep 1"]
+"#
+    }
+
+    #[cfg(windows)]
+    fn success_run_action_config() -> &'static str {
+        r#"
+actions:
+  prepare:
+    executable: "cmd"
+    args: ["/C", "exit 0"]
+services:
+  api:
+    executable: "cmd"
+    args: ["/C", "timeout /T 1 /NOBREAK >NUL"]
+"#
     }
 
     fn temp_dir(prefix: &str) -> PathBuf {

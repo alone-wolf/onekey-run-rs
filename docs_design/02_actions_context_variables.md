@@ -6,7 +6,13 @@
 
 因此需要定义一套稳定、可文档化、可校验的上下文变量规则，供 action 在 `args` 等字符串字段中引用。
 
-本设计文档只做规划，不涉及当前阶段的代码实现。
+本设计文档最初只做规划。
+
+补充说明：
+
+- 当前代码已经将同一套占位符能力用于 `service.hooks` 与 `run --action`
+- `run --action` 对未显式提供的上下文值会补默认值
+- 执行任何 action 前，CLI 会先打印该 action 本次实际使用到的参数值
 
 ## 2. 核心结论
 
@@ -75,6 +81,8 @@ actions:
   service 或 action 的退出码
 - `${exit_status}`
   更完整的退出状态字符串表示
+
+对 `run --action` 这类 standalone action，当前实现也允许传入同名上下文 key，并为未显式提供的值补默认值。
 
 ## 5. 各 hook 的可用变量建议
 
@@ -164,6 +172,39 @@ actions:
 - `${exit_code}`
 - `${exit_status}`
 
+### 5.10 `run --action` 的 standalone 上下文
+
+当 action 不是经由 service hook 触发，而是通过：
+
+```bash
+onekey-run run --action <action_name> [--arg key=value ...]
+```
+
+直接执行时，当前实现约定：
+
+- 占位符名仍然必须来自同一套受支持集合
+- `--arg` 中显式传入的值优先
+- 未显式传入的值使用 `onekey-run` 默认值
+
+当前默认值为：
+
+- `${project_root}` -> 配置文件所在目录
+- `${config_path}` -> 配置文件绝对路径
+- `${action_name}` -> 当前 action 名
+- `${hook_name}` -> `manual`
+- `${service_name}` -> `manual`
+- `${service_cwd}` -> 配置文件所在目录
+- `${service_executable}` -> 空字符串
+- `${service_pid}` -> 空字符串
+- `${stop_reason}` -> `manual`
+- `${exit_code}` -> 空字符串
+- `${exit_status}` -> `manual`
+
+若显式传入 `service_name=<name>` 且该 service 存在，则当前实现还会推导：
+
+- `${service_cwd}`
+- `${service_executable}`
+
 ## 6. 占位符展开规则建议
 
 首版建议采用最简单、最稳定的展开语义：
@@ -187,6 +228,12 @@ args: ["--label", "service=${service_name}", "--cwd", "${service_cwd}"]
 ["--label", "service=api", "--cwd", "/abs/path/to/backend"]
 ```
 
+当前实现还增加了一个执行前展示步骤：
+
+- 在 action 真正启动前
+- 先扫描该 action 实际引用到的占位符
+- 把它们本次解析出的值打印给用户查看
+
 ## 7. 未定义变量的处理建议
 
 这是实现时必须尽早钉死的一点。
@@ -199,6 +246,12 @@ args: ["--label", "service=${service_name}", "--cwd", "${service_cwd}"]
 - 运行阶段：
   - 理论上不应再出现未知占位符
   - 若因内部缺陷导致无法取值，应视为 action 执行前错误，并记录日志
+
+对于 `run --action`：
+
+- 若 `--arg` 传入未知 key，直接报错
+- 若未提供某个上下文字段，则优先使用 `onekey-run` 的默认值
+- 因此 standalone action 不采用“缺失即报错”的策略，而采用“默认值补齐”
 
 例如：
 

@@ -24,3 +24,6 @@
 | `07_instance_log_top_level_design.md` | 规划 `onekey-tasks.yaml` 顶层 `log`，用于记录 onekey-run 实例生命周期日志并复用现有 rotate/archive 逻辑 | draft |
 | `09_config_generator_design.md` | 规划配置文件生成器的建模、YAML 输出链路与分阶段实施方案，明确采用单一配置 schema + builder 的设计 | draft |
 | `10_config_naming_strict_policy_design.md` | 规划高于当前 `check` 的严格命名规范，并将其设计成配置文件可选优化能力 | draft |
+| `11_list_command_design.md` | 规划新增 `list` 子命令，用于读取配置并列出 `services`、`actions`、详细信息与 DAG 关系 | draft |
+| `12_run_command_design.md` | 规划新增 `run` 子命令，用于单独执行 service 或 action，并明确 standalone action 参数默认值与执行前参数展示规则 | draft |
+| `13_service_watch_design.md` | 规划 `services.<name>.watch` 配置，用于监控文件/目录变化并重启对应 service，明确首版不采用全局 `watches` | draft |

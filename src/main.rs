@@ -7,6 +7,7 @@ mod orchestrator;
 mod process;
 mod runtime_state;
 mod tui;
+mod watch;
 
 use clap::Parser;
 

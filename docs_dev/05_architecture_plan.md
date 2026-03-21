@@ -15,10 +15,13 @@ src/
   cli.rs
   app.rs
   error.rs
-  config/
-  orchestrator/
-  process/
-  output/
+  config.rs
+  orchestrator.rs
+  process.rs
+  file_log.rs
+  runtime_state.rs
+  tui.rs
+  watch.rs
 ```
 
 建议职责如下：
@@ -29,14 +32,20 @@ src/
   负责根据 CLI 命令调度应用流程。
 - `error.rs`
   定义统一错误类型和退出码映射。
-- `config/`
+- `config.rs`
   负责配置加载、解析、校验，以及内置模板 preset / YAML render。
-- `orchestrator/`
+- `orchestrator.rs`
   负责依赖图、状态机和全局编排流程。
-- `process/`
+- `process.rs`
   负责子进程启动、信号转发、PID 状态检查。
-- `output/`
-  负责日志聚合与终端输出。
+- `file_log.rs`
+  负责 service 日志与实例日志的文件写入、rotate、archive。
+- `runtime_state.rs`
+  负责 `.onekey-run/` 下状态文件、事件流和 registry 落盘。
+- `tui.rs`
+  负责 `up --tui` 的界面渲染与交互。
+- `watch.rs`
+  负责 service 级文件监控后端，把文件系统变化归一化成内部 watch 事件。
 
 ## 3. 关键数据模型
 
@@ -51,6 +60,8 @@ src/
 - `RunPlan`
 - `RuntimeEvent`
 - `RuntimeStateFile`
+- `ServiceWatchConfig`
+- `ResolvedServiceWatchConfig`
 
 ## 4. 关键流程
 
@@ -67,8 +78,9 @@ src/
 2. 根据目标服务计算实际运行集合
 3. 拓扑排序
 4. 逐个启动并记录运行时状态
-5. 进入运行监控循环
-6. 收到错误或退出信号后执行统一停止流程
+5. 为配置了 `watch` 的 service 建立 watcher
+6. 进入运行监控循环
+7. 收到错误或退出信号后执行统一停止流程
 
 ### `down`
 
@@ -82,7 +94,7 @@ src/
 建议保持单向依赖：
 
 - `cli` -> `app`
-- `app` -> `config`, `orchestrator`, `output`
+- `app` -> `config`, `orchestrator`
 - `orchestrator` -> `process`, `config`
 - `process` 不依赖 `cli`
 

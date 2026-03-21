@@ -124,6 +124,7 @@ log:
 - service 启动成功 / 失败 / 意外退出
 - hook started / finished / failed
 - action started / finished / failed / timeout
+- watch triggered / debounced / restart requested / restart skipped
 
 顶层实例日志的目标是“审计实例生命周期”，不是完整复制业务输出。
 
@@ -251,6 +252,42 @@ log:
   - 不拆分
   - 直接写入新活动文件
   - 允许该文件临时超过上限
+
+## 10.1 与 `services.<name>.watch` 的关系
+
+当前已实现 service 级 `watch`，因此日志设计还需要满足一个额外约束：
+
+- 若某个 service 监控了项目根目录或较大的源码目录
+- 实例日志、service 日志和 `.onekey-run/events.jsonl` 的写入不能反向触发 watch 重启循环
+
+当前实现的运行时保护为：
+
+- watch 自动忽略 `.onekey-run/`
+- watch 自动忽略顶层 `log.file`
+- watch 自动忽略任意 `service.log.file`
+- 对日志文件位于子目录中的情况，也会一并忽略其父目录链直到项目根目录前一层
+
+因此：
+
+- 用户无需额外配置 `ignore`
+- 只要使用现有 `log` / `service.log` 字段，watch 就不会因为这些内部写入而自触发
+
+## 10.2 当前已接入的 watch 事件
+
+当 watch 生效时，当前实例日志与 `events.jsonl` 会额外记录：
+
+- `watch_triggered`
+- `watch_debounced`
+- `watch_restart_requested`
+- `watch_restart_skipped`
+
+其中 `watch_restart_skipped` 目前可能表示：
+
+- 正在全局退出，跳过本次重启
+- 停止阶段失败
+- 停止成功但重新启动失败
+
+这样排查“为什么文件变了却没有重启”时，不必只看终端行为。
 
 ## 11. 当前结论
 

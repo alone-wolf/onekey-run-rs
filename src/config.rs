@@ -65,8 +65,19 @@ pub struct ServiceConfig {
     pub disabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log: Option<LogConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<ServiceWatchConfig>,
     #[serde(default, skip_serializing_if = "ServiceHooksConfig::is_empty")]
     pub hooks: ServiceHooksConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceWatchConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debounce_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +142,13 @@ pub struct ResolvedServiceConfig {
     pub stop_signal: Option<String>,
     pub stop_timeout_secs: u64,
     pub log: Option<ResolvedLogConfig>,
+    pub watch: Option<ResolvedServiceWatchConfig>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ResolvedServiceWatchConfig {
+    pub paths: Vec<PathBuf>,
+    pub debounce_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -149,13 +167,19 @@ pub struct ActionRenderContext {
     pub config_path: PathBuf,
     pub service_name: String,
     pub action_name: String,
-    pub hook_name: HookName,
+    pub hook_name: String,
     pub service_cwd: PathBuf,
     pub service_executable: String,
-    pub service_pid: Option<u32>,
+    pub service_pid: Option<String>,
     pub stop_reason: Option<String>,
-    pub exit_code: Option<i32>,
+    pub exit_code: Option<String>,
     pub exit_status: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PreparedActionExecution {
+    pub rendered_args: Vec<String>,
+    pub resolved_params: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,6 +245,7 @@ impl ProjectConfig {
                 autostart: None,
                 disabled: None,
                 log: Some(default_rotate_log("./logs/app.log")),
+                watch: None,
                 hooks: ServiceHooksConfig::default(),
             },
         );
@@ -238,6 +263,7 @@ impl ProjectConfig {
                 autostart: None,
                 disabled: None,
                 log: Some(default_rotate_log("./logs/worker.log")),
+                watch: None,
                 hooks: ServiceHooksConfig::default(),
             },
         );
@@ -269,6 +295,7 @@ impl ProjectConfig {
                 autostart: None,
                 disabled: None,
                 log: Some(default_rotate_log("./logs/app.log")),
+                watch: None,
                 hooks: ServiceHooksConfig::default(),
             },
         );
@@ -286,6 +313,7 @@ impl ProjectConfig {
                 autostart: None,
                 disabled: None,
                 log: Some(default_rotate_log("./logs/worker.log")),
+                watch: None,
                 hooks: ServiceHooksConfig::default(),
             },
         );
@@ -378,6 +406,10 @@ impl ProjectConfig {
                 autostart: Some(true),
                 disabled: Some(false),
                 log: Some(default_rotate_log("./logs/app.log")),
+                watch: Some(ServiceWatchConfig {
+                    paths: vec![PathBuf::from(".")],
+                    debounce_ms: Some(500),
+                }),
                 hooks: ServiceHooksConfig {
                     before_start: vec!["prepare-app".to_owned()],
                     after_start_success: vec!["notify-up".to_owned()],
@@ -404,6 +436,7 @@ impl ProjectConfig {
                 autostart: Some(true),
                 disabled: Some(false),
                 log: Some(default_rotate_log("./logs/worker.log")),
+                watch: None,
                 hooks: ServiceHooksConfig {
                     before_start: vec!["prepare-app".to_owned()],
                     after_start_success: Vec::new(),
@@ -505,6 +538,10 @@ impl ProjectConfig {
                 autostart: Some(true),
                 disabled: Some(false),
                 log: Some(default_rotate_log("./logs/app.log")),
+                watch: Some(ServiceWatchConfig {
+                    paths: vec![PathBuf::from(".")],
+                    debounce_ms: Some(500),
+                }),
                 hooks: ServiceHooksConfig {
                     before_start: vec!["prepare-app".to_owned()],
                     after_start_success: vec!["notify-up".to_owned()],
@@ -531,6 +568,7 @@ impl ProjectConfig {
                 autostart: Some(true),
                 disabled: Some(false),
                 log: Some(default_rotate_log("./logs/worker.log")),
+                watch: None,
                 hooks: ServiceHooksConfig {
                     before_start: vec!["prepare-app".to_owned()],
                     after_start_success: Vec::new(),
@@ -640,6 +678,13 @@ impl ProjectConfig {
 
             if let Some(log) = &service.log
                 && let Err(error) = validate_log_config(&format!("service `{name}`"), log)
+            {
+                errors.push(error.to_string());
+            }
+
+            if let Some(watch) = &service.watch
+                && let Err(error) =
+                    validate_service_watch_config(&format!("service `{name}`"), watch, config_root)
             {
                 errors.push(error.to_string());
             }
@@ -785,6 +830,10 @@ impl ProjectConfig {
                 .log
                 .as_ref()
                 .map(|log| resolve_log_config(project_root, log)),
+            watch: service
+                .watch
+                .as_ref()
+                .map(|watch| resolve_watch_config(project_root, watch)),
         })
     }
 
@@ -951,15 +1000,24 @@ impl HookName {
         }
     }
 
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "before_start" => Some(Self::BeforeStart),
+            "after_start_success" => Some(Self::AfterStartSuccess),
+            "after_start_failure" => Some(Self::AfterStartFailure),
+            "before_stop" => Some(Self::BeforeStop),
+            "after_stop_success" => Some(Self::AfterStopSuccess),
+            "after_stop_timeout" => Some(Self::AfterStopTimeout),
+            "after_stop_failure" => Some(Self::AfterStopFailure),
+            "after_runtime_exit_unexpected" => Some(Self::AfterRuntimeExitUnexpected),
+            _ => None,
+        }
+    }
+
     pub fn supports_placeholder(self, placeholder: &str) -> bool {
         match placeholder {
-            "project_root"
-            | "config_path"
-            | "service_name"
-            | "action_name"
-            | "hook_name"
-            | "service_cwd"
-            | "service_executable" => true,
+            "project_root" | "config_path" | "service_name" | "action_name" | "hook_name"
+            | "service_cwd" | "service_executable" => true,
             "service_pid" => !matches!(self, Self::BeforeStart),
             "stop_reason" => matches!(
                 self,
@@ -982,11 +1040,32 @@ impl HookName {
 
 impl ActionRenderContext {
     pub fn render_args(&self, args: &[String]) -> AppResult<Vec<String>> {
-        args.iter()
+        self.prepare(args).map(|prepared| prepared.rendered_args)
+    }
+
+    pub fn prepare(&self, args: &[String]) -> AppResult<PreparedActionExecution> {
+        let placeholders = referenced_placeholder_names(args)?;
+        let mut resolved_params = BTreeMap::new();
+        for placeholder in placeholders {
+            let value = self.resolve_placeholder(&placeholder).ok_or_else(|| {
+                AppError::config_invalid(format!(
+                    "placeholder `${{{placeholder}}}` is not available"
+                ))
+            })?;
+            resolved_params.insert(placeholder, value);
+        }
+
+        let rendered_args = args
+            .iter()
             .map(|arg| {
                 render_placeholders(arg, |placeholder| self.resolve_placeholder(placeholder))
             })
-            .collect()
+            .collect::<AppResult<Vec<_>>>()?;
+
+        Ok(PreparedActionExecution {
+            rendered_args,
+            resolved_params,
+        })
     }
 
     fn resolve_placeholder(&self, placeholder: &str) -> Option<String> {
@@ -995,12 +1074,12 @@ impl ActionRenderContext {
             "config_path" => Some(self.config_path.display().to_string()),
             "service_name" => Some(self.service_name.clone()),
             "action_name" => Some(self.action_name.clone()),
-            "hook_name" => Some(self.hook_name.as_str().to_owned()),
+            "hook_name" => Some(self.hook_name.clone()),
             "service_cwd" => Some(self.service_cwd.display().to_string()),
             "service_executable" => Some(self.service_executable.clone()),
-            "service_pid" => self.service_pid.map(|pid| pid.to_string()),
+            "service_pid" => self.service_pid.clone(),
             "stop_reason" => self.stop_reason.clone(),
-            "exit_code" => self.exit_code.map(|code| code.to_string()),
+            "exit_code" => self.exit_code.clone(),
             "exit_status" => self.exit_status.clone(),
             _ => None,
         }
@@ -1124,6 +1203,66 @@ fn validate_log_config(owner_label: &str, log: &LogConfig) -> AppResult<()> {
     }
 }
 
+fn validate_service_watch_config(
+    owner_label: &str,
+    watch: &ServiceWatchConfig,
+    project_root: &Path,
+) -> AppResult<()> {
+    if watch.paths.is_empty() {
+        return Err(AppError::config_invalid(format!(
+            "{owner_label} watch.paths must be a non-empty array"
+        )));
+    }
+
+    if let Some(debounce_ms) = watch.debounce_ms
+        && debounce_ms == 0
+    {
+        return Err(AppError::config_invalid(format!(
+            "{owner_label} watch.debounce_ms must be greater than 0"
+        )));
+    }
+
+    let mut seen = BTreeSet::new();
+    for (index, path) in watch.paths.iter().enumerate() {
+        if path.as_os_str().is_empty() {
+            return Err(AppError::config_invalid(format!(
+                "{owner_label} watch.paths[{index}] must not be empty"
+            )));
+        }
+
+        let resolved = resolve_path(project_root, path);
+        if !resolved.exists() {
+            return Err(AppError::config_invalid(format!(
+                "{owner_label} watch.paths[{index}] resolved watch path does not exist: {}",
+                resolved.display()
+            )));
+        }
+
+        let metadata = fs::symlink_metadata(&resolved).map_err(|error| {
+            AppError::config_invalid(format!(
+                "{owner_label} watch.paths[{index}] failed to inspect {}: {error}",
+                resolved.display()
+            ))
+        })?;
+        let file_type = metadata.file_type();
+        if !file_type.is_file() && !file_type.is_dir() && !file_type.is_symlink() {
+            return Err(AppError::config_invalid(format!(
+                "{owner_label} watch.paths[{index}] must resolve to a file or directory: {}",
+                resolved.display()
+            )));
+        }
+
+        if !seen.insert(resolved.clone()) {
+            return Err(AppError::config_invalid(format!(
+                "{owner_label} watch.paths contains duplicate resolved path: {}",
+                resolved.display()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 fn resolve_log_config(project_root: &Path, log: &LogConfig) -> ResolvedLogConfig {
     ResolvedLogConfig {
         file: resolve_path(project_root, &log.file),
@@ -1131,6 +1270,25 @@ fn resolve_log_config(project_root: &Path, log: &LogConfig) -> ResolvedLogConfig
         max_file_bytes: log.max_file_bytes,
         overflow_strategy: log.overflow_strategy.clone(),
         rotate_file_count: log.rotate_file_count,
+    }
+}
+
+fn resolve_watch_config(
+    project_root: &Path,
+    watch: &ServiceWatchConfig,
+) -> ResolvedServiceWatchConfig {
+    let mut paths = Vec::new();
+    let mut seen = BTreeSet::new();
+    for path in &watch.paths {
+        let resolved = resolve_path(project_root, path);
+        if seen.insert(resolved.clone()) {
+            paths.push(resolved);
+        }
+    }
+
+    ResolvedServiceWatchConfig {
+        paths,
+        debounce_ms: watch.debounce_ms.unwrap_or(500),
     }
 }
 
@@ -1153,6 +1311,10 @@ fn placeholder_names(args: &[String]) -> Result<BTreeSet<String>, String> {
 
 fn validate_placeholders(args: &[String]) -> Result<(), String> {
     placeholder_names(args).map(|_| ())
+}
+
+pub fn referenced_placeholder_names(args: &[String]) -> AppResult<BTreeSet<String>> {
+    placeholder_names(args).map_err(AppError::config_invalid)
 }
 
 fn scan_placeholders(input: &str) -> Result<Vec<String>, String> {
@@ -1245,6 +1407,10 @@ fn is_known_placeholder(name: &str) -> bool {
             | "exit_code"
             | "exit_status"
     )
+}
+
+pub fn is_known_placeholder_name(name: &str) -> bool {
+    is_known_placeholder(name)
 }
 
 fn join_config_errors(errors: Vec<String>) -> String {
@@ -1371,7 +1537,10 @@ services:
         let resolved = config
             .resolve_project_log("/tmp/project".as_ref())
             .expect("top-level log should resolve");
-        assert_eq!(resolved.file, std::path::PathBuf::from("/tmp/project/./logs/instance.log"));
+        assert_eq!(
+            resolved.file,
+            std::path::PathBuf::from("/tmp/project/./logs/instance.log")
+        );
     }
 
     #[test]
@@ -1391,6 +1560,105 @@ services:
         let config: ProjectConfig = serde_yaml::from_str(raw).unwrap();
         let error = config.validate("onekey-tasks.yaml".as_ref()).unwrap_err();
         assert!(error.to_string().contains("unknown placeholder"));
+    }
+
+    #[test]
+    fn rejects_empty_watch_paths() {
+        let raw = r#"
+services:
+  api:
+    executable: "sleep"
+    watch:
+      paths: []
+"#;
+
+        let config: ProjectConfig = serde_yaml::from_str(raw).unwrap();
+        let error = config.validate("onekey-tasks.yaml".as_ref()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("watch.paths must be a non-empty array")
+        );
+    }
+
+    #[test]
+    fn rejects_watch_paths_that_do_not_exist() {
+        let dir = temp_dir("watch-missing");
+        let path = dir.join("onekey-tasks.yaml");
+        let raw = r#"
+services:
+  api:
+    executable: "sleep"
+    watch:
+      paths: ["./missing.txt"]
+"#;
+
+        let config: ProjectConfig = serde_yaml::from_str(raw).unwrap();
+        let error = config.validate(&path).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("resolved watch path does not exist")
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rejects_zero_watch_debounce() {
+        let dir = temp_dir("watch-debounce-zero");
+        let watched = dir.join("src");
+        let path = dir.join("onekey-tasks.yaml");
+        fs::create_dir_all(&watched).unwrap();
+
+        let raw = r#"
+services:
+  api:
+    executable: "sleep"
+    watch:
+      paths: ["./src"]
+      debounce_ms: 0
+"#;
+
+        let config: ProjectConfig = serde_yaml::from_str(raw).unwrap();
+        let error = config.validate(&path).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("watch.debounce_ms must be greater than 0")
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resolves_watch_paths_relative_to_config_root() {
+        let dir = temp_dir("watch-resolve");
+        let src_dir = dir.join("src");
+        let watched_file = dir.join("Cargo.toml");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(&watched_file, "[package]\nname = \"demo\"\n").unwrap();
+
+        let raw = r#"
+services:
+  api:
+    executable: "sleep"
+    watch:
+      paths: ["./src", "./Cargo.toml"]
+      debounce_ms: 750
+"#;
+
+        let config: ProjectConfig = serde_yaml::from_str(raw).unwrap();
+        config.validate(&dir.join("onekey-tasks.yaml")).unwrap();
+        let resolved = config.resolve_service("api", &dir).unwrap();
+
+        let watch = resolved.watch.expect("watch should resolve");
+        assert_eq!(watch.debounce_ms, 750);
+        assert_eq!(watch.paths.len(), 2);
+        assert!(watch.paths.contains(&src_dir));
+        assert!(watch.paths.contains(&watched_file));
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1421,7 +1689,11 @@ services:
 
         let config: ProjectConfig = serde_yaml::from_str(raw).unwrap();
         let error = config.validate("onekey-tasks.yaml".as_ref()).unwrap_err();
-        assert!(error.to_string().contains("cannot use placeholder `${service_pid}`"));
+        assert!(
+            error
+                .to_string()
+                .contains("cannot use placeholder `${service_pid}`")
+        );
     }
 
     #[test]
@@ -1431,7 +1703,7 @@ services:
             config_path: "/tmp/project/onekey-tasks.yaml".into(),
             service_name: "api".to_owned(),
             action_name: "prepare".to_owned(),
-            hook_name: HookName::BeforeStart,
+            hook_name: HookName::BeforeStart.as_str().to_owned(),
             service_cwd: "/tmp/project/backend".into(),
             service_executable: "cargo".to_owned(),
             service_pid: None,
@@ -1451,6 +1723,38 @@ services:
         assert_eq!(rendered[0], "api");
         assert_eq!(rendered[1], "prepare");
         assert!(rendered[2].contains("/tmp/project/backend"));
+    }
+
+    #[test]
+    fn prepares_action_params_for_only_used_placeholders() {
+        let context = ActionRenderContext {
+            project_root: "/tmp/project".into(),
+            config_path: "/tmp/project/onekey-tasks.yaml".into(),
+            service_name: "api".to_owned(),
+            action_name: "notify".to_owned(),
+            hook_name: HookName::BeforeStart.as_str().to_owned(),
+            service_cwd: "/tmp/project/backend".into(),
+            service_executable: "cargo".to_owned(),
+            service_pid: Some(String::new()),
+            stop_reason: Some("manual".to_owned()),
+            exit_code: Some(String::new()),
+            exit_status: Some("manual".to_owned()),
+        };
+
+        let prepared = context
+            .prepare(&[
+                "--service".to_owned(),
+                "${service_name}".to_owned(),
+                "--hook".to_owned(),
+                "${hook_name}".to_owned(),
+            ])
+            .unwrap();
+
+        assert_eq!(prepared.rendered_args[1], "api");
+        assert_eq!(prepared.rendered_args[3], "before_start");
+        assert_eq!(prepared.resolved_params.len(), 2);
+        assert_eq!(prepared.resolved_params["service_name"], "api");
+        assert_eq!(prepared.resolved_params["hook_name"], "before_start");
     }
 
     #[test]
@@ -1508,7 +1812,12 @@ services:
 
         assert_eq!(config.services["app"].executable, "cmd");
         assert_eq!(config.services["worker"].executable, "cmd");
-        assert!(config.services["app"].args.join(" ").contains("timeout /T 30"));
+        assert!(
+            config.services["app"]
+                .args
+                .join(" ")
+                .contains("timeout /T 30")
+        );
     }
 
     #[test]

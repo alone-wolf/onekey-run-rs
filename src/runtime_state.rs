@@ -448,8 +448,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        append_event, events_path, list_registry_entries, load_events, register_instance,
-        unregister_instance, RuntimeEvent,
+        RuntimeEvent, append_event, events_path, list_registry_entries, load_events,
+        register_instance, unregister_instance,
     };
 
     use crate::runtime_state::{RuntimeState, ServiceRuntimeState};

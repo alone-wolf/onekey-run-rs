@@ -61,6 +61,7 @@ deps ready
 
 - hook 开始
 - action 开始
+- action 执行前已解析参数值
 - action 完成 / 失败
 - action 超时
 - 是否中断后续 action
@@ -185,6 +186,7 @@ before_stop
 - `hook_finished`
 - `hook_failed`
 - `action_started`
+- `action_params_resolved`
 - `action_finished`
 - `action_failed`
 - `action_timed_out`
@@ -204,6 +206,21 @@ before_stop
 - 未来本体日志
 - TUI
 - `management` 状态摘要
+
+## 11.1 action 执行前参数展示
+
+当前实现已经增加一条统一规则：
+
+- 执行任何 action 前
+- 先扫描该 action 实际引用到的占位符
+- 把它们本次解析出的值输出给用户查看
+
+建议该规则同时适用于：
+
+- `up` / `down` / 运行期 hook 链路中的 action
+- `run --action` 直接执行的 standalone action
+
+若 action 没有引用任何占位符，则输出 `(none)`，表示本次没有动态上下文参数参与渲染。
 
 ## 12. 单 service 启动状态机草案
 

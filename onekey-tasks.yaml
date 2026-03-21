@@ -59,6 +59,11 @@ services:
       max_file_bytes: 10485760
       overflow_strategy: rotate
       rotate_file_count: 5
+    watch:
+      paths:
+      - ./src
+      - ./Cargo.toml
+      debounce_ms: 500
     hooks:
       before_start:
       - prepare-app

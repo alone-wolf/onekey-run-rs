@@ -144,10 +144,7 @@ impl FileLogSink {
     }
 }
 
-fn open_log_writer(
-    path: &Path,
-    append: bool,
-) -> AppResult<(BufWriter<std::fs::File>, u64)> {
+fn open_log_writer(path: &Path, append: bool) -> AppResult<(BufWriter<std::fs::File>, u64)> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {

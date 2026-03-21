@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -13,9 +14,12 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+use crate::cli::{KeyValueArg, ListArgs, RunArgs};
 use crate::config::{
-    ActionRenderContext, HookName, ProjectConfig, ResolvedActionConfig, ResolvedLogConfig,
-    ResolvedServiceConfig,
+    ActionConfig, ActionRenderContext, HookName, LogConfig, LogOverflowStrategy,
+    PreparedActionExecution, ProjectConfig, ResolvedActionConfig, ResolvedLogConfig,
+    ResolvedServiceConfig, RestartPolicy, ServiceConfig, ServiceWatchConfig,
+    is_known_placeholder_name,
 };
 use crate::error::{AppError, AppResult};
 use crate::file_log::{FileLogSink, SharedFileLogSink};
@@ -23,6 +27,7 @@ use crate::process::{
     self, ActionRunStatus, CaptureOptions, OutputMode, SpawnedProcess, StopOutcome,
 };
 use crate::runtime_state::{self, RegistryEntry, RuntimeEvent, RuntimeLock, RuntimeState};
+use crate::watch::{self, WatchHandle};
 
 pub struct RunPlan {
     pub project_root: PathBuf,
@@ -35,6 +40,108 @@ pub struct RunPlan {
 pub struct RunOptions {
     pub tui: bool,
     pub daemonized: bool,
+}
+
+#[derive(Clone)]
+pub(crate) enum RuntimeOutputContext {
+    Plain,
+    Daemon,
+    Tui(mpsc::Sender<process::LogEvent>),
+}
+
+#[derive(Debug, Clone)]
+pub struct SingleRunRequest {
+    target: RunTarget,
+}
+
+#[derive(Debug, Clone)]
+enum RunTarget {
+    Service {
+        service_name: String,
+        hook_selection: HookSelection,
+    },
+    Action {
+        action_name: String,
+        args: BTreeMap<String, String>,
+    },
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum HookSelection {
+    None,
+    All,
+    Selected(BTreeSet<HookName>),
+}
+
+impl HookSelection {
+    fn allows(&self, hook: HookName) -> bool {
+        match self {
+            Self::None => false,
+            Self::All => true,
+            Self::Selected(selected) => selected.contains(&hook),
+        }
+    }
+}
+
+impl SingleRunRequest {
+    pub fn from_args(args: RunArgs) -> AppResult<Self> {
+        let target = match (args.service, args.action) {
+            (Some(service_name), None) => RunTarget::Service {
+                service_name,
+                hook_selection: HookSelection::from_args(
+                    args.with_all_hooks,
+                    args.without_hooks,
+                    args.hook,
+                )?,
+            },
+            (None, Some(action_name)) => RunTarget::Action {
+                action_name,
+                args: collect_standalone_action_args(args.args)?,
+            },
+            _ => {
+                return Err(AppError::config_invalid(
+                    "run command requires exactly one of `--service` or `--action`",
+                ));
+            }
+        };
+
+        Ok(Self { target })
+    }
+}
+
+impl HookSelection {
+    fn from_args(with_all_hooks: bool, without_hooks: bool, hooks: Vec<String>) -> AppResult<Self> {
+        if with_all_hooks {
+            return Ok(Self::All);
+        }
+        if without_hooks || hooks.is_empty() {
+            return Ok(Self::None);
+        }
+
+        let mut selected = BTreeSet::new();
+        for hook in hooks {
+            let parsed = HookName::parse(&hook).ok_or_else(|| {
+                AppError::config_invalid(format!(
+                    "unknown hook `{hook}`; expected one of: before_start, after_start_success, after_start_failure, before_stop, after_stop_success, after_stop_timeout, after_stop_failure, after_runtime_exit_unexpected"
+                ))
+            })?;
+            selected.insert(parsed);
+        }
+        Ok(Self::Selected(selected))
+    }
+}
+
+fn collect_standalone_action_args(args: Vec<KeyValueArg>) -> AppResult<BTreeMap<String, String>> {
+    let mut collected = BTreeMap::new();
+    for KeyValueArg { key, value } in args {
+        if !is_known_placeholder_name(&key) {
+            return Err(AppError::config_invalid(format!(
+                "unknown standalone action arg `{key}`"
+            )));
+        }
+        collected.insert(key, value);
+    }
+    Ok(collected)
 }
 
 thread_local! {
@@ -143,6 +250,846 @@ pub fn run_check(plan: &RunPlan, config: &ProjectConfig) -> AppResult<()> {
     Ok(())
 }
 
+pub fn run_list(_config_path: &Path, config: &ProjectConfig, args: ListArgs) -> AppResult<()> {
+    let request = ListRequest::from_args(args);
+    let output = render_list_output(config, &request);
+    println!("{output}");
+    Ok(())
+}
+
+pub fn run_single(
+    config_path: &Path,
+    config: &ProjectConfig,
+    request: SingleRunRequest,
+) -> AppResult<()> {
+    match request.target {
+        RunTarget::Service {
+            service_name,
+            hook_selection,
+        } => run_single_service(config_path, config, &service_name, &hook_selection),
+        RunTarget::Action { action_name, args } => {
+            run_single_action(config_path, config, &action_name, &args)
+        }
+    }
+}
+
+fn resolve_run_context(config_path: &Path) -> AppResult<(PathBuf, PathBuf)> {
+    let config_path = canonical_or_owned(config_path)?;
+    let project_root = config_path
+        .parent()
+        .ok_or_else(|| AppError::config_invalid("configuration file must have a parent directory"))?
+        .to_path_buf();
+    Ok((config_path, project_root))
+}
+
+fn standalone_action_context(
+    config: &ProjectConfig,
+    config_path: &Path,
+    project_root: &Path,
+    action_name: &str,
+    overrides: &BTreeMap<String, String>,
+) -> AppResult<ActionRenderContext> {
+    let effective_project_root = overrides
+        .get("project_root")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| project_root.to_path_buf());
+    let effective_config_path = overrides
+        .get("config_path")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| config_path.to_path_buf());
+    let inferred_service = overrides
+        .get("service_name")
+        .and_then(|service_name| config.resolve_service(service_name, project_root).ok());
+
+    let service_name = overrides
+        .get("service_name")
+        .cloned()
+        .unwrap_or_else(|| "manual".to_owned());
+    let service_cwd = overrides
+        .get("service_cwd")
+        .map(PathBuf::from)
+        .or_else(|| inferred_service.as_ref().map(|service| service.cwd.clone()))
+        .unwrap_or_else(|| effective_project_root.clone());
+    let service_executable = overrides
+        .get("service_executable")
+        .cloned()
+        .or_else(|| {
+            inferred_service
+                .as_ref()
+                .map(|service| service.executable.clone())
+        })
+        .unwrap_or_default();
+
+    Ok(ActionRenderContext {
+        project_root: effective_project_root,
+        config_path: effective_config_path,
+        service_name,
+        action_name: overrides
+            .get("action_name")
+            .cloned()
+            .unwrap_or_else(|| action_name.to_owned()),
+        hook_name: overrides
+            .get("hook_name")
+            .cloned()
+            .unwrap_or_else(|| "manual".to_owned()),
+        service_cwd,
+        service_executable,
+        service_pid: Some(overrides.get("service_pid").cloned().unwrap_or_default()),
+        stop_reason: Some(
+            overrides
+                .get("stop_reason")
+                .cloned()
+                .unwrap_or_else(|| "manual".to_owned()),
+        ),
+        exit_code: Some(overrides.get("exit_code").cloned().unwrap_or_default()),
+        exit_status: Some(
+            overrides
+                .get("exit_status")
+                .cloned()
+                .unwrap_or_else(|| "manual".to_owned()),
+        ),
+    })
+}
+
+fn run_single_action(
+    config_path: &Path,
+    config: &ProjectConfig,
+    action_name: &str,
+    overrides: &BTreeMap<String, String>,
+) -> AppResult<()> {
+    let (config_path, project_root) = resolve_run_context(config_path)?;
+    config.action_executable_exists(action_name, &project_root)?;
+    let actions = config.resolve_actions(&project_root)?;
+    let action = actions.get(action_name).ok_or_else(|| {
+        AppError::config_invalid(format!("action `{action_name}` not found in configuration"))
+    })?;
+    let context =
+        standalone_action_context(config, &config_path, &project_root, action_name, overrides)?;
+    let (rendered_action, prepared) = prepare_action_execution(action, &context)?;
+    announce_action_params(
+        None,
+        &context.service_name,
+        &context.hook_name,
+        &action.name,
+        &prepared.resolved_params,
+    );
+
+    match process::run_action(&rendered_action, &context.service_name, &context.hook_name)? {
+        ActionRunStatus::Succeeded => {
+            println!("action `{}` finished successfully", action.name);
+            Ok(())
+        }
+        ActionRunStatus::Failed { status } => Err(AppError::startup_failed(format!(
+            "action `{}` exited with status {status}",
+            action.name
+        ))),
+        ActionRunStatus::TimedOut { timeout_secs } => Err(AppError::startup_failed(format!(
+            "action `{}` timed out after {} seconds",
+            action.name, timeout_secs
+        ))),
+    }
+}
+
+fn run_single_service(
+    config_path: &Path,
+    config: &ProjectConfig,
+    service_name: &str,
+    hook_selection: &HookSelection,
+) -> AppResult<()> {
+    let (config_path, project_root) = resolve_run_context(config_path)?;
+    config.executable_exists(service_name, &project_root)?;
+    let actions = config.resolve_actions(&project_root)?;
+    let service = config.resolve_service(service_name, &project_root)?;
+    let shutdown = install_shutdown_controller()?;
+
+    if hook_selection.allows(HookName::BeforeStart) {
+        execute_hook_actions(
+            None,
+            &config_path,
+            &actions,
+            &service,
+            HookName::BeforeStart,
+            HookRuntimeExtras {
+                service_pid: None,
+                stop_reason: None,
+                exit_code: None,
+                exit_status: None,
+            },
+        )?;
+    }
+
+    let mut spawned = match process::spawn_service(
+        &service,
+        OutputMode::Capture(CaptureOptions {
+            event_sender: None,
+            log: service.log.clone(),
+            echo_to_terminal: true,
+        }),
+    ) {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            if hook_selection.allows(HookName::AfterStartFailure) {
+                let _ = execute_hook_actions(
+                    None,
+                    &config_path,
+                    &actions,
+                    &service,
+                    HookName::AfterStartFailure,
+                    HookRuntimeExtras {
+                        service_pid: None,
+                        stop_reason: None,
+                        exit_code: None,
+                        exit_status: Some(error.to_string()),
+                    },
+                );
+            }
+            return Err(error);
+        }
+    };
+
+    println!(
+        "started service `{}` with pid {}",
+        service.name, spawned.state.pid
+    );
+
+    if hook_selection.allows(HookName::AfterStartSuccess) {
+        if let Err(error) = execute_hook_actions(
+            None,
+            &config_path,
+            &actions,
+            &service,
+            HookName::AfterStartSuccess,
+            HookRuntimeExtras {
+                service_pid: Some(spawned.state.pid),
+                stop_reason: None,
+                exit_code: Some(0),
+                exit_status: Some("running".to_owned()),
+            },
+        ) {
+            eprintln!("{error}");
+        }
+    }
+
+    loop {
+        if shutdown.shutdown_requested() {
+            eprintln!("interrupt received, stopping service. press Ctrl-C again to force.");
+            stop_single_service(
+                &mut spawned,
+                &shutdown,
+                &service,
+                &actions,
+                &config_path,
+                hook_selection,
+                "ctrl_c",
+            )?;
+            return Ok(());
+        }
+
+        if let Some(status) = process::service_exited(&mut spawned.child)? {
+            if hook_selection.allows(HookName::AfterRuntimeExitUnexpected) {
+                let _ = execute_hook_actions(
+                    None,
+                    &config_path,
+                    &actions,
+                    &service,
+                    HookName::AfterRuntimeExitUnexpected,
+                    HookRuntimeExtras {
+                        service_pid: Some(spawned.state.pid),
+                        stop_reason: None,
+                        exit_code: status.code(),
+                        exit_status: Some(status.to_string()),
+                    },
+                );
+            }
+            return Err(AppError::runtime_failed(format!(
+                "service `{}` exited with status {status}",
+                service.name
+            )));
+        }
+
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn stop_single_service(
+    process: &mut SpawnedProcess,
+    shutdown: &ShutdownController,
+    service: &ResolvedServiceConfig,
+    actions: &BTreeMap<String, ResolvedActionConfig>,
+    config_path: &Path,
+    hook_selection: &HookSelection,
+    stop_reason: &str,
+) -> AppResult<()> {
+    if process::service_exited(&mut process.child)?.is_some() {
+        return Ok(());
+    }
+
+    if hook_selection.allows(HookName::BeforeStop) {
+        if let Err(error) = execute_hook_actions(
+            None,
+            config_path,
+            actions,
+            service,
+            HookName::BeforeStop,
+            HookRuntimeExtras {
+                service_pid: Some(process.state.pid),
+                stop_reason: Some(stop_reason.to_owned()),
+                exit_code: None,
+                exit_status: None,
+            },
+        ) {
+            eprintln!("{error}");
+        }
+    }
+
+    if shutdown.force_requested() {
+        force_kill_process(process)?;
+        let _ = process.child.wait();
+        return run_single_service_stop_success(
+            service,
+            actions,
+            config_path,
+            hook_selection,
+            process.state.pid,
+            stop_reason,
+            "forced",
+            None,
+        );
+    }
+
+    if let Err(error) = process::request_stop_service(&process.state) {
+        if hook_selection.allows(HookName::AfterStopFailure) {
+            if let Err(hook_error) = execute_hook_actions(
+                None,
+                config_path,
+                actions,
+                service,
+                HookName::AfterStopFailure,
+                HookRuntimeExtras {
+                    service_pid: Some(process.state.pid),
+                    stop_reason: Some(stop_reason.to_owned()),
+                    exit_code: None,
+                    exit_status: Some("request_stop_failed".to_owned()),
+                },
+            ) {
+                eprintln!("{hook_error}");
+            }
+        }
+        return Err(error);
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(process.state.stop_timeout_secs);
+    loop {
+        if process::service_exited(&mut process.child)?.is_some() {
+            return run_single_service_stop_success(
+                service,
+                actions,
+                config_path,
+                hook_selection,
+                process.state.pid,
+                stop_reason,
+                "graceful",
+                Some(0),
+            );
+        }
+
+        if shutdown.force_requested() {
+            force_kill_process(process)?;
+            let _ = process.child.wait();
+            return run_single_service_stop_success(
+                service,
+                actions,
+                config_path,
+                hook_selection,
+                process.state.pid,
+                stop_reason,
+                "forced",
+                None,
+            );
+        }
+
+        if Instant::now() >= deadline {
+            if hook_selection.allows(HookName::AfterStopTimeout) {
+                if let Err(error) = execute_hook_actions(
+                    None,
+                    config_path,
+                    actions,
+                    service,
+                    HookName::AfterStopTimeout,
+                    HookRuntimeExtras {
+                        service_pid: Some(process.state.pid),
+                        stop_reason: Some(stop_reason.to_owned()),
+                        exit_code: None,
+                        exit_status: Some("timeout".to_owned()),
+                    },
+                ) {
+                    eprintln!("{error}");
+                }
+            }
+
+            let force_result = force_kill_process(process);
+            let _ = process.child.wait();
+            return match force_result {
+                Ok(()) => run_single_service_stop_success(
+                    service,
+                    actions,
+                    config_path,
+                    hook_selection,
+                    process.state.pid,
+                    stop_reason,
+                    "timed_out_then_forced",
+                    None,
+                ),
+                Err(error) => {
+                    if hook_selection.allows(HookName::AfterStopFailure) {
+                        if let Err(hook_error) = execute_hook_actions(
+                            None,
+                            config_path,
+                            actions,
+                            service,
+                            HookName::AfterStopFailure,
+                            HookRuntimeExtras {
+                                service_pid: Some(process.state.pid),
+                                stop_reason: Some(stop_reason.to_owned()),
+                                exit_code: None,
+                                exit_status: Some("force_stop_failed".to_owned()),
+                            },
+                        ) {
+                            eprintln!("{hook_error}");
+                        }
+                    }
+                    Err(error)
+                }
+            };
+        }
+
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn run_single_service_stop_success(
+    service: &ResolvedServiceConfig,
+    actions: &BTreeMap<String, ResolvedActionConfig>,
+    config_path: &Path,
+    hook_selection: &HookSelection,
+    service_pid: u32,
+    stop_reason: &str,
+    exit_status: &str,
+    exit_code: Option<i32>,
+) -> AppResult<()> {
+    if hook_selection.allows(HookName::AfterStopSuccess) {
+        if let Err(error) = execute_hook_actions(
+            None,
+            config_path,
+            actions,
+            service,
+            HookName::AfterStopSuccess,
+            HookRuntimeExtras {
+                service_pid: Some(service_pid),
+                stop_reason: Some(stop_reason.to_owned()),
+                exit_code,
+                exit_status: Some(exit_status.to_owned()),
+            },
+        ) {
+            eprintln!("{error}");
+        }
+    }
+
+    println!(
+        "service `{}` stopped with outcome `{}`",
+        service.name, exit_status
+    );
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ListScope {
+    All,
+    Services,
+    Actions,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ListMode {
+    Names,
+    Detail,
+    Dag,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct ListRequest {
+    scope: ListScope,
+    mode: ListMode,
+}
+
+impl ListRequest {
+    fn from_args(args: ListArgs) -> Self {
+        let scope = match (args.all, args.services, args.actions) {
+            (_, true, true) | (true, _, _) | (false, false, false) => ListScope::All,
+            (false, true, false) => ListScope::Services,
+            (false, false, true) => ListScope::Actions,
+        };
+
+        let mode = if args.dag {
+            ListMode::Dag
+        } else if args.detail {
+            ListMode::Detail
+        } else {
+            ListMode::Names
+        };
+
+        Self { scope, mode }
+    }
+}
+
+fn render_list_output(config: &ProjectConfig, request: &ListRequest) -> String {
+    match request.mode {
+        ListMode::Names => render_list_names(config, request.scope),
+        ListMode::Detail => render_list_detail(config, request.scope),
+        ListMode::Dag => render_list_dag(config),
+    }
+}
+
+fn render_list_names(config: &ProjectConfig, scope: ListScope) -> String {
+    let mut sections = Vec::new();
+
+    if matches!(scope, ListScope::All | ListScope::Services) {
+        sections.push(render_name_section(
+            "services",
+            config
+                .services
+                .iter()
+                .map(|(name, service)| format_name_item(name, service.disabled.unwrap_or(false)))
+                .collect(),
+        ));
+    }
+
+    if matches!(scope, ListScope::All | ListScope::Actions) {
+        sections.push(render_name_section(
+            "actions",
+            config
+                .actions
+                .iter()
+                .map(|(name, action)| format_name_item(name, action.disabled.unwrap_or(false)))
+                .collect(),
+        ));
+    }
+
+    sections.join("\n\n")
+}
+
+fn render_list_detail(config: &ProjectConfig, scope: ListScope) -> String {
+    let mut sections = Vec::new();
+
+    if matches!(scope, ListScope::All | ListScope::Services) {
+        let mut body = String::from("services:\n");
+        if config.services.is_empty() {
+            body.push_str("- (none)\n");
+        } else {
+            for (index, (name, service)) in config.services.iter().enumerate() {
+                if index > 0 {
+                    body.push('\n');
+                }
+                append_service_detail(&mut body, name, service);
+            }
+        }
+        trim_trailing_newline(&mut body);
+        sections.push(body);
+    }
+
+    if matches!(scope, ListScope::All | ListScope::Actions) {
+        let mut body = String::from("actions:\n");
+        if config.actions.is_empty() {
+            body.push_str("- (none)\n");
+        } else {
+            for (index, (name, action)) in config.actions.iter().enumerate() {
+                if index > 0 {
+                    body.push('\n');
+                }
+                append_action_detail(&mut body, name, action);
+            }
+        }
+        trim_trailing_newline(&mut body);
+        sections.push(body);
+    }
+
+    sections.join("\n\n")
+}
+
+fn render_list_dag(config: &ProjectConfig) -> String {
+    let mut sections = Vec::new();
+    let mut dependency_lines = Vec::new();
+    let mut hook_lines = Vec::new();
+    let mut referenced_actions = BTreeSet::new();
+
+    for (service_name, service) in &config.services {
+        let service_label = format_service_label(service_name, service.disabled.unwrap_or(false));
+        for dependency in &service.depends_on {
+            let dependency_label = config
+                .services
+                .get(dependency)
+                .map(|service| format_service_label(dependency, service.disabled.unwrap_or(false)))
+                .unwrap_or_else(|| format_service_label(dependency, false));
+            dependency_lines.push(format!(
+                "- service: {service_label} --depends_on--> service: {dependency_label}"
+            ));
+        }
+
+        for hook in HookName::all() {
+            for action_name in service.hooks.actions_for(hook) {
+                referenced_actions.insert(action_name.clone());
+                let action_label = config
+                    .actions
+                    .get(action_name)
+                    .map(|action| {
+                        format_action_label(action_name, action.disabled.unwrap_or(false))
+                    })
+                    .unwrap_or_else(|| format_action_label(action_name, false));
+                hook_lines.push(format!(
+                    "- service: {service_label} --hooks.{}--> action: {action_label}",
+                    hook.as_str()
+                ));
+            }
+        }
+    }
+
+    sections.push(render_plain_section(
+        "service dependencies",
+        dependency_lines,
+    ));
+    sections.push(render_plain_section("hook references", hook_lines));
+
+    let standalone_actions = config
+        .actions
+        .iter()
+        .filter(|(name, _)| !referenced_actions.contains(*name))
+        .map(|(name, action)| format_name_item(name, action.disabled.unwrap_or(false)))
+        .collect::<Vec<_>>();
+    if !standalone_actions.is_empty() {
+        sections.push(render_name_section(
+            "standalone actions",
+            standalone_actions,
+        ));
+    }
+
+    sections.join("\n\n")
+}
+
+fn append_service_detail(output: &mut String, name: &str, service: &ServiceConfig) {
+    let _ = writeln!(
+        output,
+        "- {}{}",
+        name,
+        format_disabled_suffix(service.disabled.unwrap_or(false))
+    );
+    let _ = writeln!(output, "  executable: {}", service.executable);
+    let _ = writeln!(output, "  args: {:?}", service.args);
+    let _ = writeln!(
+        output,
+        "  cwd: {}",
+        format_optional_path(service.cwd.as_ref())
+    );
+    let _ = writeln!(output, "  env: {}", format_string_map(&service.env));
+    let _ = writeln!(output, "  depends_on: {:?}", service.depends_on);
+    let _ = writeln!(
+        output,
+        "  restart: {}",
+        format_restart_policy(service.restart.as_ref())
+    );
+    let _ = writeln!(
+        output,
+        "  stop_signal: {}",
+        format_optional_string(service.stop_signal.as_ref())
+    );
+    let _ = writeln!(
+        output,
+        "  stop_timeout_secs: {}",
+        format_optional_u64(service.stop_timeout_secs)
+    );
+    let _ = writeln!(
+        output,
+        "  autostart: {}",
+        format_optional_bool(service.autostart)
+    );
+    let _ = writeln!(output, "  disabled: {}", service.disabled.unwrap_or(false));
+    let _ = writeln!(output, "  log: {}", format_log_config(service.log.as_ref()));
+    let _ = writeln!(
+        output,
+        "  watch: {}",
+        format_watch_config(service.watch.as_ref())
+    );
+    append_hooks_detail(output, &service.hooks);
+}
+
+fn append_action_detail(output: &mut String, name: &str, action: &ActionConfig) {
+    let _ = writeln!(
+        output,
+        "- {}{}",
+        name,
+        format_disabled_suffix(action.disabled.unwrap_or(false))
+    );
+    let _ = writeln!(output, "  executable: {}", action.executable);
+    let _ = writeln!(output, "  args: {:?}", action.args);
+    let _ = writeln!(
+        output,
+        "  cwd: {}",
+        format_optional_path(action.cwd.as_ref())
+    );
+    let _ = writeln!(output, "  env: {}", format_string_map(&action.env));
+    let _ = writeln!(
+        output,
+        "  timeout_secs: {}",
+        format_optional_u64(action.timeout_secs)
+    );
+    let _ = writeln!(output, "  disabled: {}", action.disabled.unwrap_or(false));
+}
+
+fn append_hooks_detail(output: &mut String, hooks: &crate::config::ServiceHooksConfig) {
+    if hooks.before_start.is_empty()
+        && hooks.after_start_success.is_empty()
+        && hooks.after_start_failure.is_empty()
+        && hooks.before_stop.is_empty()
+        && hooks.after_stop_success.is_empty()
+        && hooks.after_stop_timeout.is_empty()
+        && hooks.after_stop_failure.is_empty()
+        && hooks.after_runtime_exit_unexpected.is_empty()
+    {
+        let _ = writeln!(output, "  hooks: none");
+        return;
+    }
+
+    let _ = writeln!(output, "  hooks:");
+    for hook in HookName::all() {
+        let actions = hooks.actions_for(hook);
+        if actions.is_empty() {
+            continue;
+        }
+        let _ = writeln!(output, "    {}: {:?}", hook.as_str(), actions);
+    }
+}
+
+fn render_name_section(title: &str, items: Vec<String>) -> String {
+    render_plain_section(
+        title,
+        if items.is_empty() {
+            vec!["- (none)".to_owned()]
+        } else {
+            items.into_iter().map(|item| format!("- {item}")).collect()
+        },
+    )
+}
+
+fn render_plain_section(title: &str, items: Vec<String>) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "{title}:");
+    if items.is_empty() {
+        output.push_str("- (none)\n");
+    } else {
+        for item in items {
+            let _ = writeln!(output, "{item}");
+        }
+    }
+    trim_trailing_newline(&mut output);
+    output
+}
+
+fn format_name_item(name: &str, disabled: bool) -> String {
+    format!("{name}{}", format_disabled_suffix(disabled))
+}
+
+fn format_service_label(name: &str, disabled: bool) -> String {
+    format_name_item(name, disabled)
+}
+
+fn format_action_label(name: &str, disabled: bool) -> String {
+    format_name_item(name, disabled)
+}
+
+fn format_disabled_suffix(disabled: bool) -> &'static str {
+    if disabled { " [disabled]" } else { "" }
+}
+
+fn format_optional_path(path: Option<&PathBuf>) -> String {
+    path.map(|path| path.display().to_string())
+        .unwrap_or_else(|| "none".to_owned())
+}
+
+fn format_string_map(values: &BTreeMap<String, String>) -> String {
+    if values.is_empty() {
+        "{}".to_owned()
+    } else {
+        format!("{values:?}")
+    }
+}
+
+fn format_optional_string(value: Option<&String>) -> String {
+    value.cloned().unwrap_or_else(|| "none".to_owned())
+}
+
+fn format_optional_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_owned())
+}
+
+fn format_optional_bool(value: Option<bool>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_owned())
+}
+
+fn format_restart_policy(policy: Option<&RestartPolicy>) -> String {
+    match policy {
+        Some(RestartPolicy::No) => "no".to_owned(),
+        Some(RestartPolicy::OnFailure) => "on-failure".to_owned(),
+        Some(RestartPolicy::Always) => "always".to_owned(),
+        None => "none".to_owned(),
+    }
+}
+
+fn format_log_config(log: Option<&LogConfig>) -> String {
+    let Some(log) = log else {
+        return "none".to_owned();
+    };
+
+    format!(
+        "file={} append={} max_file_bytes={} overflow_strategy={} rotate_file_count={}",
+        log.file.display(),
+        log.append,
+        format_optional_u64(log.max_file_bytes),
+        format_overflow_strategy(log.overflow_strategy.as_ref()),
+        log.rotate_file_count
+            .map(|count| count.to_string())
+            .unwrap_or_else(|| "none".to_owned())
+    )
+}
+
+fn format_watch_config(watch: Option<&ServiceWatchConfig>) -> String {
+    let Some(watch) = watch else {
+        return "none".to_owned();
+    };
+
+    format!(
+        "paths={:?} debounce_ms={}",
+        watch.paths,
+        format_optional_u64(watch.debounce_ms)
+    )
+}
+
+fn format_overflow_strategy(strategy: Option<&LogOverflowStrategy>) -> String {
+    match strategy {
+        Some(LogOverflowStrategy::Rotate) => "rotate".to_owned(),
+        Some(LogOverflowStrategy::Archive) => "archive".to_owned(),
+        None => "none".to_owned(),
+    }
+}
+
+fn trim_trailing_newline(output: &mut String) {
+    if output.ends_with('\n') {
+        output.pop();
+    }
+}
+
 fn install_instance_logger(config: Option<ResolvedLogConfig>) -> AppResult<InstanceLogGuard> {
     let sink = match config {
         Some(config) => Some(FileLogSink::open_shared(config)?),
@@ -200,30 +1147,30 @@ fn run_up_plain(plan: RunPlan) -> AppResult<()> {
     );
 
     let shutdown = install_shutdown_controller()?;
-    let mut running = match start_services(&plan, &mut runtime_state, |service| {
-        if service.log.is_some() {
-            OutputMode::Capture(CaptureOptions {
-                event_sender: None,
-                log: service.log.clone(),
-                echo_to_terminal: false,
-            })
-        } else {
-            OutputMode::Null
-        }
-    }) {
+    let output_context = RuntimeOutputContext::Plain;
+    let mut running = match start_services(&plan, &mut runtime_state, &output_context) {
         Ok(running) => running,
         Err(error) => {
-            let cleanup_result =
-                runtime_state::cleanup_runtime_files(&plan.project_root).and_then(|_| lock.release());
+            let cleanup_result = runtime_state::cleanup_runtime_files(&plan.project_root)
+                .and_then(|_| lock.release());
             cleanup_result?;
             return Err(error);
         }
     };
+    let mut watch_runtime = WatchRuntime::start(&plan)?;
     runtime_state::register_instance(&runtime_state)?;
 
     render_plain_status(&running, Duration::from_secs(0))?;
 
-    let runtime_result = monitor_plain_processes(&plan, &mut running, &shutdown);
+    let runtime_result = monitor_plain_processes(
+        &plan,
+        &mut running,
+        &mut runtime_state,
+        watch_runtime.as_mut(),
+        &shutdown,
+        &output_context,
+    );
+    drop(watch_runtime);
     let stop_reason = determine_stop_reason(&runtime_result, &shutdown, "ctrl_c");
     emit_runtime_event(
         &plan.project_root,
@@ -233,12 +1180,7 @@ fn run_up_plain(plan: RunPlan) -> AppResult<()> {
         None,
         format_detail_fields(&[("reason", stop_reason.to_owned())]),
     );
-    let shutdown_result = shutdown_running_services(
-        &mut running,
-        &shutdown,
-        &plan,
-        stop_reason,
-    );
+    let shutdown_result = shutdown_running_services(&mut running, &shutdown, &plan, stop_reason);
 
     let cleanup_result =
         runtime_state::cleanup_runtime_files(&plan.project_root).and_then(|_| lock.release());
@@ -288,26 +1230,30 @@ fn run_up_tui(plan: RunPlan) -> AppResult<()> {
     let shutdown = install_shutdown_controller()?;
 
     let (log_tx, log_rx) = mpsc::channel();
-    let mut running = match start_services(&plan, &mut runtime_state, |service| {
-        OutputMode::Capture(CaptureOptions {
-            event_sender: Some(log_tx.clone()),
-            log: service.log.clone(),
-            echo_to_terminal: false,
-        })
-    }) {
+    let output_context = RuntimeOutputContext::Tui(log_tx.clone());
+    let mut running = match start_services(&plan, &mut runtime_state, &output_context) {
         Ok(running) => running,
         Err(error) => {
-            let cleanup_result =
-                runtime_state::cleanup_runtime_files(&plan.project_root).and_then(|_| lock.release());
+            let cleanup_result = runtime_state::cleanup_runtime_files(&plan.project_root)
+                .and_then(|_| lock.release());
             cleanup_result?;
             return Err(error);
         }
     };
+    let mut watch_runtime = WatchRuntime::start(&plan)?;
     runtime_state::register_instance(&runtime_state)?;
     drop(log_tx);
 
-    let runtime_result =
-        crate::tui::run_dashboard(&plan.project_root, &mut running, log_rx, shutdown.clone());
+    let runtime_result = crate::tui::run_dashboard(
+        &plan,
+        &mut running,
+        &mut runtime_state,
+        watch_runtime.as_mut(),
+        log_rx,
+        shutdown.clone(),
+        &output_context,
+    );
+    drop(watch_runtime);
     let stop_reason = determine_stop_reason(&runtime_result, &shutdown, "ctrl_c");
     emit_runtime_event(
         &plan.project_root,
@@ -317,12 +1263,7 @@ fn run_up_tui(plan: RunPlan) -> AppResult<()> {
         None,
         format_detail_fields(&[("reason", stop_reason.to_owned())]),
     );
-    let shutdown_result = shutdown_running_services(
-        &mut running,
-        &shutdown,
-        &plan,
-        stop_reason,
-    );
+    let shutdown_result = shutdown_running_services(&mut running, &shutdown, &plan, stop_reason);
     let cleanup_result =
         runtime_state::cleanup_runtime_files(&plan.project_root).and_then(|_| lock.release());
     emit_runtime_event(
@@ -368,28 +1309,28 @@ fn run_up_daemonized(plan: RunPlan) -> AppResult<()> {
     );
 
     let shutdown = install_shutdown_controller()?;
-    let mut running = match start_services(&plan, &mut runtime_state, |service| {
-        if service.log.is_some() {
-            OutputMode::Capture(CaptureOptions {
-                event_sender: None,
-                log: service.log.clone(),
-                echo_to_terminal: false,
-            })
-        } else {
-            OutputMode::Null
-        }
-    }) {
+    let output_context = RuntimeOutputContext::Daemon;
+    let mut running = match start_services(&plan, &mut runtime_state, &output_context) {
         Ok(running) => running,
         Err(error) => {
-            let cleanup_result =
-                runtime_state::cleanup_runtime_files(&plan.project_root).and_then(|_| lock.release());
+            let cleanup_result = runtime_state::cleanup_runtime_files(&plan.project_root)
+                .and_then(|_| lock.release());
             cleanup_result?;
             return Err(error);
         }
     };
+    let mut watch_runtime = WatchRuntime::start(&plan)?;
     runtime_state::register_instance(&runtime_state)?;
 
-    let runtime_result = monitor_daemon_processes(&plan, &mut running, &shutdown);
+    let runtime_result = monitor_daemon_processes(
+        &plan,
+        &mut running,
+        &mut runtime_state,
+        watch_runtime.as_mut(),
+        &shutdown,
+        &output_context,
+    );
+    drop(watch_runtime);
     let stop_reason = determine_stop_reason(&runtime_result, &shutdown, "ctrl_c");
     emit_runtime_event(
         &plan.project_root,
@@ -399,12 +1340,7 @@ fn run_up_daemonized(plan: RunPlan) -> AppResult<()> {
         None,
         format_detail_fields(&[("reason", stop_reason.to_owned())]),
     );
-    let shutdown_result = shutdown_running_services(
-        &mut running,
-        &shutdown,
-        &plan,
-        stop_reason,
-    );
+    let shutdown_result = shutdown_running_services(&mut running, &shutdown, &plan, stop_reason);
     let cleanup_result =
         runtime_state::cleanup_runtime_files(&plan.project_root).and_then(|_| lock.release());
     emit_runtime_event(
@@ -824,19 +1760,380 @@ fn current_unix_secs() -> u64 {
         .as_secs()
 }
 
+fn output_mode_for_service(
+    service: &ResolvedServiceConfig,
+    output_context: &RuntimeOutputContext,
+) -> OutputMode {
+    match output_context {
+        RuntimeOutputContext::Plain | RuntimeOutputContext::Daemon => {
+            if service.log.is_some() {
+                OutputMode::Capture(CaptureOptions {
+                    event_sender: None,
+                    log: service.log.clone(),
+                    echo_to_terminal: false,
+                })
+            } else {
+                OutputMode::Null
+            }
+        }
+        RuntimeOutputContext::Tui(log_tx) => OutputMode::Capture(CaptureOptions {
+            event_sender: Some(log_tx.clone()),
+            log: service.log.clone(),
+            echo_to_terminal: false,
+        }),
+    }
+}
+
+#[derive(Debug)]
+struct PendingWatchRestart {
+    changed_path: PathBuf,
+    ready_at: Instant,
+}
+
+pub struct WatchRuntime {
+    raw_rx: mpsc::Receiver<watch::WatchEvent>,
+    handles: Vec<WatchHandle>,
+    pending: BTreeMap<String, PendingWatchRestart>,
+}
+
+impl WatchRuntime {
+    fn start(plan: &RunPlan) -> AppResult<Option<Self>> {
+        let watched_services = plan
+            .services
+            .iter()
+            .filter(|service| service.watch.is_some())
+            .collect::<Vec<_>>();
+        if watched_services.is_empty() {
+            return Ok(None);
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let ignore_paths = watch_ignore_paths(plan);
+        let mut handles = Vec::with_capacity(watched_services.len());
+
+        for service in watched_services {
+            let watch = service
+                .watch
+                .as_ref()
+                .expect("filtered service watch config must exist");
+            handles.push(watch::spawn_service_watcher(
+                watch::WatchRequest {
+                    service_name: service.name.clone(),
+                    paths: watch.paths.clone(),
+                    ignore_paths: ignore_paths.clone(),
+                    poll_interval: Duration::from_millis(200),
+                },
+                tx.clone(),
+            ));
+        }
+
+        drop(tx);
+
+        Ok(Some(Self {
+            raw_rx: rx,
+            handles,
+            pending: BTreeMap::new(),
+        }))
+    }
+
+    pub fn tick(
+        &mut self,
+        plan: &RunPlan,
+        running: &mut Vec<SpawnedProcess>,
+        runtime_state: &mut RuntimeState,
+        shutdown: &ShutdownController,
+        output_context: &RuntimeOutputContext,
+    ) -> AppResult<()> {
+        while let Ok(event) = self.raw_rx.try_recv() {
+            let Some(service) = plan
+                .services
+                .iter()
+                .find(|service| service.name == event.service_name)
+            else {
+                continue;
+            };
+            let Some(watch) = service.watch.as_ref() else {
+                continue;
+            };
+
+            emit_runtime_event(
+                &plan.project_root,
+                "watch_triggered",
+                Some(&service.name),
+                None,
+                None,
+                format_detail_fields(&[
+                    ("path", event.changed_path.display().to_string()),
+                    ("debounce_ms", watch.debounce_ms.to_string()),
+                ]),
+            );
+            self.pending.insert(
+                service.name.clone(),
+                PendingWatchRestart {
+                    changed_path: event.changed_path,
+                    ready_at: Instant::now() + Duration::from_millis(watch.debounce_ms),
+                },
+            );
+        }
+
+        if shutdown.shutdown_requested() {
+            while let Some((service_name, pending)) = self.pending.pop_first() {
+                emit_runtime_event(
+                    &plan.project_root,
+                    "watch_restart_skipped",
+                    Some(&service_name),
+                    None,
+                    None,
+                    format_detail_fields(&[
+                        ("reason", "shutdown".to_owned()),
+                        ("path", pending.changed_path.display().to_string()),
+                    ]),
+                );
+            }
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        let due_service_name = self.pending.iter().find_map(|(service_name, pending)| {
+            (pending.ready_at <= now).then(|| service_name.clone())
+        });
+        let Some(service_name) = due_service_name else {
+            return Ok(());
+        };
+        let Some(pending) = self.pending.remove(&service_name) else {
+            return Ok(());
+        };
+
+        emit_runtime_event(
+            &plan.project_root,
+            "watch_debounced",
+            Some(&service_name),
+            None,
+            None,
+            format_detail_fields(&[
+                ("path", pending.changed_path.display().to_string()),
+                ("state", "ready".to_owned()),
+            ]),
+        );
+
+        restart_service_from_watch(
+            plan,
+            &service_name,
+            &pending.changed_path,
+            running,
+            runtime_state,
+            shutdown,
+            output_context,
+        )
+    }
+}
+
+impl Drop for WatchRuntime {
+    fn drop(&mut self) {
+        for handle in &self.handles {
+            handle.stop();
+        }
+    }
+}
+
+fn watch_ignore_paths(plan: &RunPlan) -> Vec<PathBuf> {
+    let mut ignored = BTreeSet::new();
+    ignored.insert(plan.project_root.join(runtime_state::RUNTIME_DIR));
+    collect_ignore_path(
+        &mut ignored,
+        &plan.project_root,
+        plan.instance_log.as_ref().map(|log| &log.file),
+    );
+    for service in &plan.services {
+        collect_ignore_path(
+            &mut ignored,
+            &plan.project_root,
+            service.log.as_ref().map(|log| &log.file),
+        );
+    }
+    ignored.into_iter().collect()
+}
+
+fn collect_ignore_path(
+    ignored: &mut BTreeSet<PathBuf>,
+    project_root: &Path,
+    path: Option<&PathBuf>,
+) {
+    let Some(path) = path else {
+        return;
+    };
+
+    ignored.insert(path.clone());
+    let mut current = path.parent();
+    while let Some(parent) = current {
+        if parent == project_root {
+            break;
+        }
+        ignored.insert(parent.to_path_buf());
+        current = parent.parent();
+    }
+}
+
+fn restart_service_from_watch(
+    plan: &RunPlan,
+    service_name: &str,
+    changed_path: &Path,
+    running: &mut Vec<SpawnedProcess>,
+    runtime_state: &mut RuntimeState,
+    shutdown: &ShutdownController,
+    output_context: &RuntimeOutputContext,
+) -> AppResult<()> {
+    emit_runtime_event(
+        &plan.project_root,
+        "watch_restart_requested",
+        Some(service_name),
+        None,
+        None,
+        format_detail_fields(&[("path", changed_path.display().to_string())]),
+    );
+    emit_plain_watch_notice(
+        output_context,
+        &format!(
+            "watch: restarting {} because {} changed",
+            service_name,
+            changed_path.display()
+        ),
+    );
+
+    let Some(service) = plan
+        .services
+        .iter()
+        .find(|service| service.name == service_name)
+    else {
+        emit_runtime_event(
+            &plan.project_root,
+            "watch_restart_skipped",
+            Some(service_name),
+            None,
+            None,
+            format_detail_fields(&[
+                ("reason", "service_not_found".to_owned()),
+                ("path", changed_path.display().to_string()),
+            ]),
+        );
+        emit_plain_watch_notice(
+            output_context,
+            &format!(
+                "watch: skipped restart for {} (service not found)",
+                service_name
+            ),
+        );
+        return Ok(());
+    };
+
+    if let Some(index) = running
+        .iter()
+        .position(|process| process.state.service_name == service_name)
+    {
+        let stop_result = {
+            let mut force_notice_shown = false;
+            stop_spawned_process(
+                &mut running[index],
+                shutdown,
+                &mut force_notice_shown,
+                plan,
+                "watch",
+            )
+        };
+        match stop_result {
+            Ok(()) => {
+                running.remove(index);
+                runtime_state
+                    .services
+                    .retain(|entry| entry.service_name != service_name);
+                runtime_state::write_state(&plan.project_root, runtime_state)?;
+            }
+            Err(error) => {
+                emit_runtime_event(
+                    &plan.project_root,
+                    "watch_restart_skipped",
+                    Some(service_name),
+                    None,
+                    None,
+                    format_detail_fields(&[
+                        ("reason", "stop_failed".to_owned()),
+                        ("path", changed_path.display().to_string()),
+                        ("detail", error.to_string()),
+                    ]),
+                );
+                emit_plain_watch_notice(
+                    output_context,
+                    &format!("watch: failed to stop {} for restart", service_name),
+                );
+                return Err(error);
+            }
+        }
+    }
+
+    match start_service(plan, runtime_state, service, output_context) {
+        Ok(spawned) => {
+            running.push(spawned);
+        }
+        Err(error) => {
+            runtime_state
+                .services
+                .retain(|entry| entry.service_name != service_name);
+            runtime_state::write_state(&plan.project_root, runtime_state)?;
+            emit_runtime_event(
+                &plan.project_root,
+                "watch_restart_skipped",
+                Some(service_name),
+                None,
+                None,
+                format_detail_fields(&[
+                    ("reason", "start_failed".to_owned()),
+                    ("path", changed_path.display().to_string()),
+                    ("detail", error.to_string()),
+                ]),
+            );
+            emit_plain_watch_notice(
+                output_context,
+                &format!(
+                    "watch: restart of {} failed; waiting for next change",
+                    service_name
+                ),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn emit_plain_watch_notice(output_context: &RuntimeOutputContext, message: &str) {
+    if !matches!(output_context, RuntimeOutputContext::Plain) {
+        return;
+    }
+
+    print!("\r\x1b[2K");
+    println!("{message}");
+}
+
 fn monitor_plain_processes(
     plan: &RunPlan,
-    running: &mut [SpawnedProcess],
+    running: &mut Vec<SpawnedProcess>,
+    runtime_state: &mut RuntimeState,
+    watch_runtime: Option<&mut WatchRuntime>,
     shutdown: &ShutdownController,
+    output_context: &RuntimeOutputContext,
 ) -> AppResult<()> {
     let started_at = std::time::Instant::now();
     let mut last_rendered_secs = 0;
+    let mut watch_runtime = watch_runtime;
 
     loop {
         if shutdown.shutdown_requested() {
             println!();
             eprintln!("interrupt received, stopping services. press Ctrl-C again to force.");
             return Ok(());
+        }
+
+        if let Some(watch_runtime) = watch_runtime.as_mut() {
+            watch_runtime.tick(plan, running, runtime_state, shutdown, output_context)?;
         }
 
         for process in running.iter_mut() {
@@ -862,53 +2159,44 @@ fn monitor_plain_processes(
     }
 }
 
-fn start_services<F>(
+fn start_service(
     plan: &RunPlan,
     runtime_state: &mut RuntimeState,
-    mut output_mode_for: F,
-) -> AppResult<Vec<SpawnedProcess>>
-where
-    F: FnMut(&ResolvedServiceConfig) -> OutputMode,
-{
-    let mut running = Vec::new();
-    for service in &plan.services {
+    service: &ResolvedServiceConfig,
+    output_context: &RuntimeOutputContext,
+) -> AppResult<SpawnedProcess> {
+    emit_runtime_event(
+        &plan.project_root,
+        "service_starting",
+        Some(&service.name),
+        None,
+        None,
+        format!("starting service `{}`", service.name),
+    );
+    if let Err(error) = run_hook_with_context(
+        plan,
+        service,
+        HookName::BeforeStart,
+        HookRuntimeExtras {
+            service_pid: None,
+            stop_reason: None,
+            exit_code: None,
+            exit_status: None,
+        },
+    ) {
         emit_runtime_event(
             &plan.project_root,
-            "service_starting",
+            "service_start_aborted",
             Some(&service.name),
+            Some(HookName::BeforeStart.as_str()),
             None,
-            None,
-            format!("starting service `{}`", service.name),
+            error.to_string(),
         );
-        if let Err(error) = run_hook_with_context(
-            plan,
-            service,
-            HookName::BeforeStart,
-            HookRuntimeExtras {
-                service_pid: None,
-                stop_reason: None,
-                exit_code: None,
-                exit_status: None,
-            },
-        ) {
-            emit_runtime_event(
-                &plan.project_root,
-                "service_start_aborted",
-                Some(&service.name),
-                Some(HookName::BeforeStart.as_str()),
-                None,
-                error.to_string(),
-            );
-            shutdown_running_services(
-                &mut running,
-                &ShutdownController::force_requested_now(),
-                plan,
-                "startup_failure",
-            )?;
-            return Err(error);
-        }
+        return Err(error);
+    }
 
-        let spawned = match process::spawn_service(service, output_mode_for(service)) {
+    let spawned =
+        match process::spawn_service(service, output_mode_for_service(service, output_context)) {
             Ok(spawned) => spawned,
             Err(error) => {
                 emit_runtime_event(
@@ -932,6 +2220,51 @@ where
                 ) {
                     eprintln!("{hook_error}");
                 }
+                return Err(error);
+            }
+        };
+    runtime_state
+        .services
+        .retain(|entry| entry.service_name != service.name);
+    runtime_state.services.push(spawned.state.clone());
+    runtime_state::write_state(&plan.project_root, runtime_state)?;
+    emit_runtime_event(
+        &plan.project_root,
+        "service_running",
+        Some(&service.name),
+        None,
+        None,
+        format!(
+            "service `{}` entered running with pid {}",
+            service.name, spawned.state.pid
+        ),
+    );
+    if let Err(error) = run_hook_with_context(
+        plan,
+        service,
+        HookName::AfterStartSuccess,
+        HookRuntimeExtras {
+            service_pid: Some(spawned.state.pid),
+            stop_reason: None,
+            exit_code: Some(0),
+            exit_status: Some("running".to_owned()),
+        },
+    ) {
+        eprintln!("{error}");
+    }
+    Ok(spawned)
+}
+
+fn start_services(
+    plan: &RunPlan,
+    runtime_state: &mut RuntimeState,
+    output_context: &RuntimeOutputContext,
+) -> AppResult<Vec<SpawnedProcess>> {
+    let mut running = Vec::new();
+    for service in &plan.services {
+        match start_service(plan, runtime_state, service, output_context) {
+            Ok(spawned) => running.push(spawned),
+            Err(error) => {
                 shutdown_running_services(
                     &mut running,
                     &ShutdownController::force_requested_now(),
@@ -940,31 +2273,7 @@ where
                 )?;
                 return Err(error);
             }
-        };
-        runtime_state.services.push(spawned.state.clone());
-        runtime_state::write_state(&plan.project_root, runtime_state)?;
-        emit_runtime_event(
-            &plan.project_root,
-            "service_running",
-            Some(&service.name),
-            None,
-            None,
-            format!("service `{}` entered running with pid {}", service.name, spawned.state.pid),
-        );
-        if let Err(error) = run_hook_with_context(
-            plan,
-            service,
-            HookName::AfterStartSuccess,
-            HookRuntimeExtras {
-                service_pid: Some(spawned.state.pid),
-                stop_reason: None,
-                exit_code: Some(0),
-                exit_status: Some("running".to_owned()),
-            },
-        ) {
-            eprintln!("{error}");
         }
-        running.push(spawned);
     }
     Ok(running)
 }
@@ -1013,12 +2322,21 @@ fn handle_runtime_exit(
 
 fn monitor_daemon_processes(
     plan: &RunPlan,
-    running: &mut [SpawnedProcess],
+    running: &mut Vec<SpawnedProcess>,
+    runtime_state: &mut RuntimeState,
+    watch_runtime: Option<&mut WatchRuntime>,
     shutdown: &ShutdownController,
+    output_context: &RuntimeOutputContext,
 ) -> AppResult<()> {
+    let mut watch_runtime = watch_runtime;
+
     loop {
         if shutdown.shutdown_requested() {
             return Ok(());
+        }
+
+        if let Some(watch_runtime) = watch_runtime.as_mut() {
+            watch_runtime.tick(plan, running, runtime_state, shutdown, output_context)?;
         }
 
         for process in running.iter_mut() {
@@ -1419,7 +2737,10 @@ fn event_level(event_type: &str) -> &'static str {
         | "hook_failed"
         | "action_failed"
         | "service_runtime_exit_unexpected" => "ERROR",
-        "instance_stopping" | "service_stop_timeout" | "action_timed_out" => "WARN",
+        "instance_stopping"
+        | "service_stop_timeout"
+        | "action_timed_out"
+        | "watch_restart_skipped" => "WARN",
         _ => "INFO",
     }
 }
@@ -1476,8 +2797,75 @@ fn load_hook_bundle_from_state(state: &runtime_state::RuntimeState) -> Option<Ho
     })
 }
 
-fn run_hook_with_context(
-    plan: &RunPlan,
+fn prepare_action_execution(
+    action: &ResolvedActionConfig,
+    context: &ActionRenderContext,
+) -> AppResult<(ResolvedActionConfig, PreparedActionExecution)> {
+    let prepared = context.prepare(&action.args)?;
+    let mut rendered_action = action.clone();
+    rendered_action.args = prepared.rendered_args.clone();
+    Ok((rendered_action, prepared))
+}
+
+fn format_action_params_preview(
+    action_name: &str,
+    resolved_params: &BTreeMap<String, String>,
+) -> String {
+    let mut lines = vec![format!("action `{action_name}` resolved params:")];
+    if resolved_params.is_empty() {
+        lines.push("- (none)".to_owned());
+        return lines.join("\n");
+    }
+
+    for (key, value) in resolved_params {
+        lines.push(format!("- {key}={value}"));
+    }
+    lines.join("\n")
+}
+
+fn format_action_params_summary(
+    action_name: &str,
+    resolved_params: &BTreeMap<String, String>,
+) -> String {
+    if resolved_params.is_empty() {
+        return format!("action `{action_name}` resolved params: (none)");
+    }
+
+    let joined = resolved_params
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("action `{action_name}` resolved params: {joined}")
+}
+
+fn announce_action_params(
+    project_root: Option<&Path>,
+    service_name: &str,
+    hook_name: &str,
+    action_name: &str,
+    resolved_params: &BTreeMap<String, String>,
+) {
+    println!(
+        "{}",
+        format_action_params_preview(action_name, resolved_params)
+    );
+    if let Some(project_root) = project_root {
+        emit_runtime_event(
+            project_root,
+            "action_params_resolved",
+            Some(service_name),
+            Some(hook_name),
+            Some(action_name),
+            format_action_params_summary(action_name, resolved_params),
+        );
+    }
+}
+
+fn execute_hook_actions(
+    project_root: Option<&Path>,
+    config_path: &Path,
+    actions: &BTreeMap<String, ResolvedActionConfig>,
     service: &ResolvedServiceConfig,
     hook: HookName,
     extras: HookRuntimeExtras,
@@ -1487,72 +2875,88 @@ fn run_hook_with_context(
         return Ok(());
     }
 
-    emit_runtime_event(
-        &plan.project_root,
-        "hook_started",
-        Some(&service.name),
-        Some(hook.as_str()),
-        None,
-        format!(
-            "hook `{}` started for service `{}` with {} action(s)",
-            hook.as_str(),
-            service.name,
-            action_names.len()
-        ),
-    );
+    if let Some(project_root) = project_root {
+        emit_runtime_event(
+            project_root,
+            "hook_started",
+            Some(&service.name),
+            Some(hook.as_str()),
+            None,
+            format!(
+                "hook `{}` started for service `{}` with {} action(s)",
+                hook.as_str(),
+                service.name,
+                action_names.len()
+            ),
+        );
+    }
 
     for action_name in action_names {
-        let action = plan.actions.get(action_name).ok_or_else(|| {
+        let action = actions.get(action_name).ok_or_else(|| {
             AppError::config_invalid(format!(
                 "service `{}` references unknown action `{action_name}` in `{}`",
                 service.name,
                 hook.as_str()
             ))
         })?;
-        emit_runtime_event(
-            &plan.project_root,
-            "action_started",
-            Some(&service.name),
-            Some(hook.as_str()),
-            Some(&action.name),
-            format!(
-                "action `{}` started for service `{}` hook `{}`",
-                action.name,
-                service.name,
-                hook.as_str()
-            ),
-        );
+        if let Some(project_root) = project_root {
+            emit_runtime_event(
+                project_root,
+                "action_started",
+                Some(&service.name),
+                Some(hook.as_str()),
+                Some(&action.name),
+                format!(
+                    "action `{}` started for service `{}` hook `{}`",
+                    action.name,
+                    service.name,
+                    hook.as_str()
+                ),
+            );
+        }
 
         let context = ActionRenderContext {
-            project_root: plan.project_root.clone(),
-            config_path: plan.config_path.clone(),
+            project_root: config_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf(),
+            config_path: config_path.to_path_buf(),
             service_name: service.name.clone(),
             action_name: action.name.clone(),
-            hook_name: hook,
+            hook_name: hook.as_str().to_owned(),
             service_cwd: service.cwd.clone(),
             service_executable: service.executable.clone(),
-            service_pid: extras.service_pid,
+            service_pid: extras.service_pid.map(|pid| pid.to_string()),
             stop_reason: extras.stop_reason.clone(),
-            exit_code: extras.exit_code,
+            exit_code: extras.exit_code.map(|code| code.to_string()),
             exit_status: extras.exit_status.clone(),
         };
-        let mut rendered_action = action.clone();
-        rendered_action.args = context.render_args(&action.args)?;
-        match process::run_action(&rendered_action, &service.name, hook)? {
+        let (rendered_action, prepared) = prepare_action_execution(action, &context)?;
+        announce_action_params(
+            project_root,
+            &service.name,
+            hook.as_str(),
+            &action.name,
+            &prepared.resolved_params,
+        );
+
+        match process::run_action(&rendered_action, &service.name, hook.as_str())? {
             ActionRunStatus::Succeeded => {
-                emit_runtime_event(
-                    &plan.project_root,
-                    "action_finished",
-                    Some(&service.name),
-                    Some(hook.as_str()),
-                    Some(&action.name),
-                    format!(
-                        "action `{}` finished for service `{}` hook `{}`",
-                        action.name,
-                        service.name,
-                        hook.as_str()
-                    ),
-                );
+                if let Some(project_root) = project_root {
+                    emit_runtime_event(
+                        project_root,
+                        "action_finished",
+                        Some(&service.name),
+                        Some(hook.as_str()),
+                        Some(&action.name),
+                        format!(
+                            "action `{}` finished for service `{}` hook `{}`",
+                            action.name,
+                            service.name,
+                            hook.as_str()
+                        ),
+                    );
+                }
             }
             ActionRunStatus::Failed { status } => {
                 let error = AppError::startup_failed(format!(
@@ -1561,22 +2965,24 @@ fn run_hook_with_context(
                     service.name,
                     hook.as_str()
                 ));
-                emit_runtime_event(
-                    &plan.project_root,
-                    "action_failed",
-                    Some(&service.name),
-                    Some(hook.as_str()),
-                    Some(&action.name),
-                    error.to_string(),
-                );
-                emit_runtime_event(
-                    &plan.project_root,
-                    "hook_failed",
-                    Some(&service.name),
-                    Some(hook.as_str()),
-                    None,
-                    error.to_string(),
-                );
+                if let Some(project_root) = project_root {
+                    emit_runtime_event(
+                        project_root,
+                        "action_failed",
+                        Some(&service.name),
+                        Some(hook.as_str()),
+                        Some(&action.name),
+                        error.to_string(),
+                    );
+                    emit_runtime_event(
+                        project_root,
+                        "hook_failed",
+                        Some(&service.name),
+                        Some(hook.as_str()),
+                        None,
+                        error.to_string(),
+                    );
+                }
                 return Err(error);
             }
             ActionRunStatus::TimedOut { timeout_secs } => {
@@ -1587,36 +2993,60 @@ fn run_hook_with_context(
                     hook.as_str(),
                     timeout_secs
                 ));
-                emit_runtime_event(
-                    &plan.project_root,
-                    "action_timed_out",
-                    Some(&service.name),
-                    Some(hook.as_str()),
-                    Some(&action.name),
-                    error.to_string(),
-                );
-                emit_runtime_event(
-                    &plan.project_root,
-                    "hook_failed",
-                    Some(&service.name),
-                    Some(hook.as_str()),
-                    None,
-                    error.to_string(),
-                );
+                if let Some(project_root) = project_root {
+                    emit_runtime_event(
+                        project_root,
+                        "action_timed_out",
+                        Some(&service.name),
+                        Some(hook.as_str()),
+                        Some(&action.name),
+                        error.to_string(),
+                    );
+                    emit_runtime_event(
+                        project_root,
+                        "hook_failed",
+                        Some(&service.name),
+                        Some(hook.as_str()),
+                        None,
+                        error.to_string(),
+                    );
+                }
                 return Err(error);
             }
         }
     }
 
-    emit_runtime_event(
-        &plan.project_root,
-        "hook_finished",
-        Some(&service.name),
-        Some(hook.as_str()),
-        None,
-        format!("hook `{}` finished for service `{}`", hook.as_str(), service.name),
-    );
+    if let Some(project_root) = project_root {
+        emit_runtime_event(
+            project_root,
+            "hook_finished",
+            Some(&service.name),
+            Some(hook.as_str()),
+            None,
+            format!(
+                "hook `{}` finished for service `{}`",
+                hook.as_str(),
+                service.name
+            ),
+        );
+    }
     Ok(())
+}
+
+fn run_hook_with_context(
+    plan: &RunPlan,
+    service: &ResolvedServiceConfig,
+    hook: HookName,
+    extras: HookRuntimeExtras,
+) -> AppResult<()> {
+    execute_hook_actions(
+        Some(&plan.project_root),
+        &plan.config_path,
+        &plan.actions,
+        service,
+        hook,
+        extras,
+    )
 }
 
 fn run_hook_with_bundle(
@@ -1625,141 +3055,14 @@ fn run_hook_with_bundle(
     hook: HookName,
     extras: HookRuntimeExtras,
 ) -> AppResult<()> {
-    let action_names = service.hooks.actions_for(hook);
-    if action_names.is_empty() {
-        return Ok(());
-    }
-
-    emit_runtime_event(
-        &bundle.project_root,
-        "hook_started",
-        Some(&service.name),
-        Some(hook.as_str()),
-        None,
-        format!(
-            "hook `{}` started for service `{}` with {} action(s)",
-            hook.as_str(),
-            service.name,
-            action_names.len()
-        ),
-    );
-
-    for action_name in action_names {
-        let action = bundle.actions.get(action_name).ok_or_else(|| {
-            AppError::config_invalid(format!(
-                "service `{}` references unknown action `{action_name}` in `{}`",
-                service.name,
-                hook.as_str()
-            ))
-        })?;
-        emit_runtime_event(
-            &bundle.project_root,
-            "action_started",
-            Some(&service.name),
-            Some(hook.as_str()),
-            Some(&action.name),
-            format!(
-                "action `{}` started for service `{}` hook `{}`",
-                action.name,
-                service.name,
-                hook.as_str()
-            ),
-        );
-
-        let context = ActionRenderContext {
-            project_root: bundle.project_root.clone(),
-            config_path: bundle.config_path.clone(),
-            service_name: service.name.clone(),
-            action_name: action.name.clone(),
-            hook_name: hook,
-            service_cwd: service.cwd.clone(),
-            service_executable: service.executable.clone(),
-            service_pid: extras.service_pid,
-            stop_reason: extras.stop_reason.clone(),
-            exit_code: extras.exit_code,
-            exit_status: extras.exit_status.clone(),
-        };
-        let mut rendered_action = action.clone();
-        rendered_action.args = context.render_args(&action.args)?;
-        match process::run_action(&rendered_action, &service.name, hook)? {
-            ActionRunStatus::Succeeded => {
-                emit_runtime_event(
-                    &bundle.project_root,
-                    "action_finished",
-                    Some(&service.name),
-                    Some(hook.as_str()),
-                    Some(&action.name),
-                    format!(
-                        "action `{}` finished for service `{}` hook `{}`",
-                        action.name,
-                        service.name,
-                        hook.as_str()
-                    ),
-                );
-            }
-            ActionRunStatus::Failed { status } => {
-                let error = AppError::startup_failed(format!(
-                    "action `{}` for service `{}` hook `{}` exited with status {status}",
-                    action.name,
-                    service.name,
-                    hook.as_str()
-                ));
-                emit_runtime_event(
-                    &bundle.project_root,
-                    "action_failed",
-                    Some(&service.name),
-                    Some(hook.as_str()),
-                    Some(&action.name),
-                    error.to_string(),
-                );
-                emit_runtime_event(
-                    &bundle.project_root,
-                    "hook_failed",
-                    Some(&service.name),
-                    Some(hook.as_str()),
-                    None,
-                    error.to_string(),
-                );
-                return Err(error);
-            }
-            ActionRunStatus::TimedOut { timeout_secs } => {
-                let error = AppError::startup_failed(format!(
-                    "action `{}` for service `{}` hook `{}` timed out after {} seconds",
-                    action.name,
-                    service.name,
-                    hook.as_str(),
-                    timeout_secs
-                ));
-                emit_runtime_event(
-                    &bundle.project_root,
-                    "action_timed_out",
-                    Some(&service.name),
-                    Some(hook.as_str()),
-                    Some(&action.name),
-                    error.to_string(),
-                );
-                emit_runtime_event(
-                    &bundle.project_root,
-                    "hook_failed",
-                    Some(&service.name),
-                    Some(hook.as_str()),
-                    None,
-                    error.to_string(),
-                );
-                return Err(error);
-            }
-        }
-    }
-
-    emit_runtime_event(
-        &bundle.project_root,
-        "hook_finished",
-        Some(&service.name),
-        Some(hook.as_str()),
-        None,
-        format!("hook `{}` finished for service `{}`", hook.as_str(), service.name),
-    );
-    Ok(())
+    execute_hook_actions(
+        Some(&bundle.project_root),
+        &bundle.config_path,
+        &bundle.actions,
+        service,
+        hook,
+        extras,
+    )
 }
 
 fn stop_recorded_service(
@@ -2082,22 +3385,29 @@ fn canonical_or_owned(path: &Path) -> AppResult<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
     use std::process::Command;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU8;
+    use std::thread;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    use crate::cli::{KeyValueArg, ListArgs, RunArgs};
     use crate::config::{HookName, ProjectConfig, ResolvedLogConfig};
     use crate::process::SpawnedProcess;
     use crate::runtime_state::{
-        self, PlatformRuntimeState, RegistryEntry, RuntimeEvent, ServiceRuntimeState,
+        self, PlatformRuntimeState, RegistryEntry, RuntimeEvent, RuntimeState, ServiceRuntimeState,
     };
 
     use super::{
-        build_run_plan, current_unix_secs, emit_runtime_event, format_detail_fields,
-        handle_runtime_exit, install_instance_logger, run_hook_with_context, run_init,
+        HookRuntimeExtras, HookSelection, ListRequest, ManagementEntry, RuntimeOutputContext,
+        ShutdownController, SingleRunRequest, WatchRuntime, build_run_plan, current_unix_secs,
+        emit_runtime_event, format_action_params_preview, format_detail_fields,
+        handle_runtime_exit, install_instance_logger, render_list_output, run_hook_with_context,
+        run_init, shutdown_running_services, standalone_action_context, start_services,
         summarize_instance_status, summarize_last_event, summarize_service_events,
-        HookRuntimeExtras, ManagementEntry,
     };
 
     #[test]
@@ -2144,6 +3454,8 @@ mod tests {
         assert!(raw.contains("after_runtime_exit_unexpected:"));
         assert!(raw.contains("notify-exit:"));
         assert!(raw.contains("restart:"));
+        assert!(raw.contains("watch:"));
+        assert!(raw.contains("debounce_ms: 500"));
         assert!(raw.contains("env:"));
         assert!(raw.contains("./logs/app.log"));
         assert!(raw.contains("stop_signal:"));
@@ -2152,6 +3464,238 @@ mod tests {
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn list_names_include_services_actions_and_disabled_marker() {
+        let dir = temp_dir("list-names");
+        let config_path = dir.join("onekey-tasks.yaml");
+        fs::write(&config_path, list_test_config()).unwrap();
+
+        let config = ProjectConfig::load(&config_path).unwrap();
+        let output = render_list_output(
+            &config,
+            &ListRequest::from_args(ListArgs {
+                all: false,
+                services: false,
+                actions: false,
+                detail: false,
+                dag: false,
+            }),
+        );
+
+        assert!(output.contains("services:"));
+        assert!(output.contains("- api"));
+        assert!(output.contains("- worker [disabled]"));
+        assert!(output.contains("actions:"));
+        assert!(output.contains("- cleanup [disabled]"));
+        assert!(output.contains("- orphan"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn list_detail_outputs_selected_fields() {
+        let dir = temp_dir("list-detail");
+        let config_path = dir.join("onekey-tasks.yaml");
+        fs::write(&config_path, list_test_config()).unwrap();
+
+        let config = ProjectConfig::load(&config_path).unwrap();
+        let output = render_list_output(
+            &config,
+            &ListRequest::from_args(ListArgs {
+                all: false,
+                services: false,
+                actions: false,
+                detail: true,
+                dag: false,
+            }),
+        );
+
+        assert!(output.contains("services:"));
+        assert!(output.contains("stop_timeout_secs: 15"));
+        assert!(output.contains("hooks:"));
+        assert!(output.contains("before_start: [\"notify\"]"));
+        assert!(output.contains("actions:"));
+        assert!(output.contains("timeout_secs: 30"));
+        assert!(output.contains("disabled: true"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn list_detail_includes_watch_config_when_present() {
+        let dir = temp_dir("list-detail-watch");
+        let config_path = dir.join("onekey-tasks.yaml");
+        let watch_dir = dir.join("src");
+        fs::create_dir_all(&watch_dir).unwrap();
+        fs::write(
+            &config_path,
+            r#"
+services:
+  api:
+    executable: "echo"
+    watch:
+      paths: ["./src"]
+      debounce_ms: 250
+"#,
+        )
+        .unwrap();
+
+        let config = ProjectConfig::load(&config_path).unwrap();
+        let output = render_list_output(
+            &config,
+            &ListRequest::from_args(ListArgs {
+                all: false,
+                services: false,
+                actions: false,
+                detail: true,
+                dag: false,
+            }),
+        );
+
+        assert!(output.contains("watch: paths=[\"./src\"] debounce_ms=250"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn list_dag_outputs_dependencies_hook_edges_and_standalone_actions() {
+        let dir = temp_dir("list-dag");
+        let config_path = dir.join("onekey-tasks.yaml");
+        fs::write(&config_path, list_test_config()).unwrap();
+
+        let config = ProjectConfig::load(&config_path).unwrap();
+        let output = render_list_output(
+            &config,
+            &ListRequest::from_args(ListArgs {
+                all: false,
+                services: false,
+                actions: false,
+                detail: false,
+                dag: true,
+            }),
+        );
+
+        assert!(output.contains("service dependencies:"));
+        assert!(output.contains("service: worker [disabled] --depends_on--> service: api"));
+        assert!(output.contains("hook references:"));
+        assert!(output.contains("service: api --hooks.before_start--> action: notify"));
+        assert!(output.contains("standalone actions:"));
+        assert!(output.contains("- cleanup [disabled]"));
+        assert!(output.contains("- orphan"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn single_run_request_defaults_service_mode_to_no_hooks() {
+        let request = SingleRunRequest::from_args(RunArgs {
+            service: Some("api".to_owned()),
+            action: None,
+            with_all_hooks: false,
+            without_hooks: false,
+            hook: Vec::new(),
+            args: Vec::new(),
+        })
+        .unwrap();
+
+        match request.target {
+            super::RunTarget::Service {
+                service_name,
+                hook_selection,
+            } => {
+                assert_eq!(service_name, "api");
+                assert_eq!(hook_selection, HookSelection::None);
+            }
+            _ => panic!("expected service run target"),
+        }
+    }
+
+    #[test]
+    fn single_run_request_accepts_selected_hooks() {
+        let request = SingleRunRequest::from_args(RunArgs {
+            service: Some("api".to_owned()),
+            action: None,
+            with_all_hooks: false,
+            without_hooks: false,
+            hook: vec!["before_start".to_owned(), "after_stop_success".to_owned()],
+            args: Vec::new(),
+        })
+        .unwrap();
+
+        match request.target {
+            super::RunTarget::Service { hook_selection, .. } => {
+                assert!(hook_selection.allows(HookName::BeforeStart));
+                assert!(hook_selection.allows(HookName::AfterStopSuccess));
+                assert!(!hook_selection.allows(HookName::AfterStartFailure));
+            }
+            _ => panic!("expected service run target"),
+        }
+    }
+
+    #[test]
+    fn single_run_request_rejects_unknown_action_arg_name() {
+        let error = SingleRunRequest::from_args(RunArgs {
+            service: None,
+            action: Some("notify".to_owned()),
+            with_all_hooks: false,
+            without_hooks: false,
+            hook: Vec::new(),
+            args: vec![KeyValueArg {
+                key: "servie_name".to_owned(),
+                value: "api".to_owned(),
+            }],
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unknown standalone action arg"));
+    }
+
+    #[test]
+    fn standalone_action_context_infers_service_fields_from_service_name() {
+        let dir = temp_dir("standalone-context");
+        let config_path = dir.join("onekey-tasks.yaml");
+        fs::write(
+            &config_path,
+            r#"
+actions:
+  notify:
+    executable: "echo"
+services:
+  api:
+    executable: "cargo"
+    cwd: ./backend
+"#,
+        )
+        .unwrap();
+
+        let config = ProjectConfig::load(&config_path).unwrap();
+        let overrides = BTreeMap::from([("service_name".to_owned(), "api".to_owned())]);
+        let context =
+            standalone_action_context(&config, &config_path, &dir, "notify", &overrides).unwrap();
+
+        assert_eq!(context.service_name, "api");
+        assert!(context.service_cwd.ends_with("backend"));
+        assert_eq!(context.service_executable, "cargo");
+        assert_eq!(context.hook_name, "manual");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn action_params_preview_lists_each_used_param() {
+        let preview = format_action_params_preview(
+            "notify",
+            &BTreeMap::from([
+                ("hook_name".to_owned(), "before_start".to_owned()),
+                ("service_name".to_owned(), "api".to_owned()),
+            ]),
+        );
+
+        assert!(preview.contains("action `notify` resolved params:"));
+        assert!(preview.contains("- hook_name=before_start"));
+        assert!(preview.contains("- service_name=api"));
     }
 
     #[test]
@@ -2297,6 +3841,7 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
         let events_raw = fs::read_to_string(runtime_state::events_path(&dir)).unwrap();
         assert!(events_raw.contains("\"event_type\":\"hook_started\""));
+        assert!(events_raw.contains("\"event_type\":\"action_params_resolved\""));
         assert!(events_raw.contains("\"event_type\":\"action_finished\""));
 
         let _ = fs::remove_dir_all(&dir);
@@ -2394,6 +3939,113 @@ mod tests {
         assert!(events_raw.contains("\"event_type\":\"service_runtime_exit_unexpected\""));
         assert!(events_raw.contains("\"hook_name\":\"after_runtime_exit_unexpected\""));
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn watch_restart_restarts_service_and_runs_stop_hook() {
+        let dir = temp_dir("watch-restart");
+        let config_path = dir.join("onekey-tasks.yaml");
+        let trigger_path = dir.join("trigger.txt");
+        fs::write(&trigger_path, "v1\n").unwrap();
+        fs::write(&config_path, watch_restart_config()).unwrap();
+        fs::create_dir_all(dir.join(runtime_state::RUNTIME_DIR)).unwrap();
+
+        let config = ProjectConfig::load(&config_path).unwrap();
+        let plan = build_run_plan(&config, &config_path, &[]).unwrap();
+        let output_context = RuntimeOutputContext::Plain;
+        let mut runtime_state = RuntimeState::new(dir.clone(), config_path.clone(), None);
+        let mut running = start_services(&plan, &mut runtime_state, &output_context).unwrap();
+        let mut watch_runtime = WatchRuntime::start(&plan).unwrap().unwrap();
+        let shutdown = test_shutdown_controller();
+        let original_pid = running[0].state.pid;
+
+        thread::sleep(Duration::from_millis(300));
+        fs::write(&trigger_path, "v2\n").unwrap();
+        wait_for_watch_tick(
+            &mut watch_runtime,
+            &plan,
+            &mut running,
+            &mut runtime_state,
+            &shutdown,
+            &output_context,
+            |running| running[0].state.pid != original_pid,
+        );
+
+        assert_ne!(running[0].state.pid, original_pid);
+        let stop_reasons = fs::read_to_string(dir.join("stop-reasons.log")).unwrap();
+        assert!(stop_reasons.lines().any(|line| line == "watch"));
+
+        drop(watch_runtime);
+        shutdown_running_services(&mut running, &shutdown, &plan, "test_cleanup").unwrap();
+        let _ = runtime_state::cleanup_runtime_files(&dir);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn watch_ignores_runtime_and_log_file_changes() {
+        let dir = temp_dir("watch-ignore");
+        let config_path = dir.join("onekey-tasks.yaml");
+        let watched_file = dir.join("src.txt");
+        fs::write(&watched_file, "v1\n").unwrap();
+        fs::write(&config_path, watch_ignore_config()).unwrap();
+        fs::create_dir_all(dir.join(runtime_state::RUNTIME_DIR)).unwrap();
+
+        let config = ProjectConfig::load(&config_path).unwrap();
+        let plan = build_run_plan(&config, &config_path, &[]).unwrap();
+        let output_context = RuntimeOutputContext::Plain;
+        let mut runtime_state = RuntimeState::new(
+            dir.clone(),
+            config_path.clone(),
+            plan.instance_log.as_ref().map(|log| log.file.clone()),
+        );
+        let mut running = start_services(&plan, &mut runtime_state, &output_context).unwrap();
+        let mut watch_runtime = WatchRuntime::start(&plan).unwrap().unwrap();
+        let shutdown = test_shutdown_controller();
+        let original_pid = running[0].state.pid;
+
+        thread::sleep(Duration::from_millis(300));
+        emit_runtime_event(
+            &dir,
+            "manual_probe",
+            Some("api"),
+            None,
+            None,
+            "testing runtime event ignore".to_owned(),
+        );
+        fs::create_dir_all(dir.join("logs")).unwrap();
+        fs::write(dir.join("logs").join("api.log"), "service-log\n").unwrap();
+        fs::write(dir.join("logs").join("onekey-run.log"), "instance-log\n").unwrap();
+
+        for _ in 0..10 {
+            watch_runtime
+                .tick(
+                    &plan,
+                    &mut running,
+                    &mut runtime_state,
+                    &shutdown,
+                    &output_context,
+                )
+                .unwrap();
+            thread::sleep(Duration::from_millis(120));
+        }
+        assert_eq!(running[0].state.pid, original_pid);
+
+        fs::write(&watched_file, "v2\n").unwrap();
+        wait_for_watch_tick(
+            &mut watch_runtime,
+            &plan,
+            &mut running,
+            &mut runtime_state,
+            &shutdown,
+            &output_context,
+            |running| running[0].state.pid != original_pid,
+        );
+        assert_ne!(running[0].state.pid, original_pid);
+
+        drop(watch_runtime);
+        shutdown_running_services(&mut running, &shutdown, &plan, "test_cleanup").unwrap();
+        let _ = runtime_state::cleanup_runtime_files(&dir);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2557,6 +4209,151 @@ services:
 "#
     }
 
+    fn watch_restart_config() -> String {
+        format!(
+            r#"
+actions:
+  record-stop:
+    executable: "{action_executable}"
+    args: {action_args}
+    cwd: .
+services:
+  api:
+    executable: "{service_executable}"
+    args: {service_args}
+    cwd: .
+    log:
+      file: ./logs/api.log
+      append: true
+    watch:
+      paths: ["./trigger.txt"]
+      debounce_ms: 150
+    hooks:
+      before_stop: ["record-stop"]
+"#,
+            action_executable = watch_action_executable(),
+            action_args = yaml_string_array(&watch_record_stop_args()),
+            service_executable = watch_service_executable(),
+            service_args = yaml_string_array(&watch_service_args()),
+        )
+    }
+
+    fn watch_ignore_config() -> String {
+        format!(
+            r#"
+log:
+  file: ./logs/onekey-run.log
+  append: true
+services:
+  api:
+    executable: "{service_executable}"
+    args: {service_args}
+    cwd: .
+    log:
+      file: ./logs/api.log
+      append: true
+    watch:
+      paths: ["./"]
+      debounce_ms: 150
+"#,
+            service_executable = watch_service_executable(),
+            service_args = yaml_string_array(&watch_service_args()),
+        )
+    }
+
+    fn test_shutdown_controller() -> ShutdownController {
+        ShutdownController {
+            signal_count: Arc::new(AtomicU8::new(0)),
+        }
+    }
+
+    fn wait_for_watch_tick<F>(
+        watch_runtime: &mut WatchRuntime,
+        plan: &super::RunPlan,
+        running: &mut Vec<SpawnedProcess>,
+        runtime_state: &mut RuntimeState,
+        shutdown: &ShutdownController,
+        output_context: &RuntimeOutputContext,
+        predicate: F,
+    ) where
+        F: Fn(&[SpawnedProcess]) -> bool,
+    {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            watch_runtime
+                .tick(plan, running, runtime_state, shutdown, output_context)
+                .unwrap();
+            if predicate(running) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        panic!("timed out waiting for watch-triggered state change");
+    }
+
+    #[cfg(unix)]
+    fn watch_service_executable() -> &'static str {
+        "sh"
+    }
+
+    #[cfg(windows)]
+    fn watch_service_executable() -> &'static str {
+        "cmd"
+    }
+
+    #[cfg(unix)]
+    fn watch_service_args() -> Vec<String> {
+        vec![
+            "-c".to_owned(),
+            "trap 'exit 0' TERM INT; while true; do sleep 1; done".to_owned(),
+        ]
+    }
+
+    #[cfg(windows)]
+    fn watch_service_args() -> Vec<String> {
+        vec![
+            "/C".to_owned(),
+            "powershell -NoProfile -Command \"while ($true) { Start-Sleep -Seconds 1 }\""
+                .to_owned(),
+        ]
+    }
+
+    #[cfg(unix)]
+    fn watch_action_executable() -> &'static str {
+        "sh"
+    }
+
+    #[cfg(windows)]
+    fn watch_action_executable() -> &'static str {
+        "cmd"
+    }
+
+    #[cfg(unix)]
+    fn watch_record_stop_args() -> Vec<String> {
+        vec![
+            "-c".to_owned(),
+            "printf '%s\\n' \"${stop_reason}\" >> ./stop-reasons.log".to_owned(),
+        ]
+    }
+
+    #[cfg(windows)]
+    fn watch_record_stop_args() -> Vec<String> {
+        vec![
+            "/C".to_owned(),
+            "echo ${stop_reason}>> stop-reasons.log".to_owned(),
+        ]
+    }
+
+    fn yaml_string_array(values: &[String]) -> String {
+        let rendered = values
+            .iter()
+            .map(|value| serde_json::to_string(value).unwrap())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("[{rendered}]")
+    }
+
     fn temp_dir(prefix: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2565,5 +4362,39 @@ services:
         let dir = std::env::temp_dir().join(format!("onekey-run-rs-{prefix}-{unique}"));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn list_test_config() -> &'static str {
+        r#"
+actions:
+  cleanup:
+    executable: "echo"
+    disabled: true
+  notify:
+    executable: "echo"
+    args: ["service-started"]
+    cwd: .
+    timeout_secs: 30
+  orphan:
+    executable: "echo"
+services:
+  api:
+    executable: "echo"
+    args: ["api"]
+    cwd: .
+    env:
+      RUST_LOG: info
+    stop_timeout_secs: 15
+    autostart: true
+    log:
+      file: ./logs/api.log
+      append: true
+    hooks:
+      before_start: ["notify"]
+  worker:
+    executable: "echo"
+    depends_on: ["api"]
+    disabled: true
+"#
     }
 }

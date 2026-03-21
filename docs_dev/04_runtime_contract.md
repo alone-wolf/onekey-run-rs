@@ -58,6 +58,53 @@
 - 退避策略
 - 重启是否影响依赖服务
 
+## 6.1 `watch` 触发的重启语义
+
+当前已实现 `services.<name>.watch`，其运行时语义如下：
+
+- service 成功进入运行态后，若配置了 `watch`，则会启动对应 watcher
+- watcher 可监控文件或目录；目录默认递归监控
+- 同一 service 的连续文件事件会经过 `debounce_ms` 防抖后再触发一次重启
+- watch 只重启当前 service，不自动级联重启依赖它的其他 service
+
+watch 触发的重启路径为：
+
+1. 记录 `watch_triggered`
+2. 防抖后记录 `watch_debounced`
+3. 记录 `watch_restart_requested`
+4. 对当前 service 执行一次带原因的 stop + start
+
+也就是说，watch 不是单独的一套“热重载专用流程”，而是复用现有生命周期主流程。
+
+## 6.2 `watch` 与 hooks 的关系
+
+watch 重启会复用现有 hooks：
+
+- `before_stop`
+- `after_stop_success`
+- `after_stop_timeout`
+- `after_stop_failure`
+- `before_start`
+- `after_start_success`
+- `after_start_failure`
+
+并且：
+
+- `before_stop` 中的 `${stop_reason}` 当前会渲染为 `watch`
+- watch 主动重启不会触发 `after_runtime_exit_unexpected`
+
+## 6.3 `watch` 失败后的行为
+
+当前实现中，watch 触发重启若停止阶段失败，会把该错误视为运行时错误并向上传递。
+
+若停止成功但重新启动失败：
+
+- 当前 service 会保持“未运行”
+- watcher 仍继续保留
+- 后续再次修改 watch 目标时，仍会继续尝试启动该 service
+
+因此 watch 既支持“运行中的服务重启”，也支持“已停服务因下一次文件变化被重新拉起”。
+
 ## 7. 停止语义
 
 - 停止顺序应为依赖逆序
@@ -93,7 +140,7 @@
 - stdout / stderr 是否合并展示，需要统一
 - 内部调度日志与服务业务日志是否分流，需要明确
 - 当前已存在一条内部事件输出通道：`.onekey-run/events.jsonl`
-- 该事件流会记录 service / hook / action 的关键生命周期事件，供后续本体日志与 TUI 复用
+- 该事件流会记录 service / hook / action / watch 的关键生命周期事件，供后续本体日志与 TUI 复用
 
 ## 9.1 实例日志与运行时文件
 
@@ -160,6 +207,14 @@
   - `runtime_ok="true|false"`
   - `shutdown_ok="true|false"`
   - `cleanup_ok="true|false"`
+- `watch_triggered`
+  - `path="..."`
+  - `debounce_ms="..."`
+- `watch_restart_requested`
+  - `path="..."`
+- `watch_restart_skipped`
+  - `reason="shutdown|service_not_found|stop_failed|start_failed"`
+  - `path="..."`
 
 这样做的原因：
 

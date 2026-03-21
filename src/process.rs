@@ -5,9 +5,7 @@ use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::config::{
-    HookName, ResolvedActionConfig, ResolvedLogConfig, ResolvedServiceConfig,
-};
+use crate::config::{ResolvedActionConfig, ResolvedLogConfig, ResolvedServiceConfig};
 use crate::error::{AppError, AppResult};
 use crate::file_log::{FileLogSink, SharedFileLogSink};
 use crate::runtime_state::{PlatformRuntimeState, ServiceRuntimeState};
@@ -58,7 +56,7 @@ pub enum StopOutcome {
 pub fn run_action(
     action: &ResolvedActionConfig,
     service_name: &str,
-    hook_name: HookName,
+    hook_name: &str,
 ) -> AppResult<ActionRunStatus> {
     let mut command = Command::new(&action.executable);
     command
@@ -74,10 +72,7 @@ pub fn run_action(
     let mut child = command.spawn().map_err(|error| {
         AppError::startup_failed(format!(
             "failed to start action `{}` for service `{}` hook `{}` with executable `{}`: {error}",
-            action.name,
-            service_name,
-            hook_name.as_str(),
-            action.executable
+            action.name, service_name, hook_name, action.executable
         ))
     })?;
 
@@ -86,9 +81,7 @@ pub fn run_action(
         if let Some(status) = child.try_wait().map_err(|error| {
             AppError::startup_failed(format!(
                 "failed to inspect action `{}` for service `{}` hook `{}`: {error}",
-                action.name,
-                service_name,
-                hook_name.as_str()
+                action.name, service_name, hook_name
             ))
         })? {
             if status.success() {

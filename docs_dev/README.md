@@ -25,6 +25,9 @@
 | `09_runtime_state_persistence.md` | 定义 `down` 命令依赖的 pid / state / lock 落盘规则 | draft |
 | `10_logging_design.md` | 定义日志文件写入、容量上限、rotate/archive 语义与命名规则 | draft |
 | `11_config_generator_tasks.md` | 将配置文件生成器设计拆成可直接编码的任务清单、文件改动点与验收标准 | draft |
+| `13_run_command_tasks.md` | 将 `run` 子命令设计拆成可直接编码的任务清单、实施顺序、文件改动点与验收标准 | draft |
+| `12_list_command_tasks.md` | 将 `list` 命令设计拆成可直接编码的任务清单、文件改动点与验收标准 | draft |
+| `14_service_watch_tasks.md` | 将 `services.<name>.watch` 设计拆成可直接编码的任务清单、实施顺序、文件改动点与验收标准 | draft |
 
 ## 规划阶段必须准备的文档
 

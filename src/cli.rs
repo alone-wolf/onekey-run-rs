@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -35,6 +35,10 @@ pub enum Command {
     Init(InitArgs),
     #[command(about = "Validate configuration, dependency graph, and executables")]
     Check,
+    #[command(about = "List configured services, actions, and dependency relationships")]
+    List(ListArgs),
+    #[command(about = "Run a single service or action for debugging")]
+    Run(RunArgs),
     #[command(about = "Start services defined in the configuration")]
     Up(UpArgs),
     #[command(about = "Stop services started by a previous up command")]
@@ -69,6 +73,87 @@ pub struct UpArgs {
     pub services: Vec<String>,
 }
 
+#[derive(Debug, Args, Clone)]
+pub struct ListArgs {
+    #[arg(
+        long,
+        help = "List both services and actions; equivalent to --services --actions"
+    )]
+    pub all: bool,
+    #[arg(long, help = "List services only")]
+    pub services: bool,
+    #[arg(long, help = "List actions only")]
+    pub actions: bool,
+    #[arg(
+        long,
+        conflicts_with = "dag",
+        help = "Show detailed configuration fields"
+    )]
+    pub detail: bool,
+    #[arg(
+        long = "DAG",
+        alias = "dag",
+        conflicts_with_all = ["all", "services", "actions", "detail"],
+        help = "Show service dependencies and hook-to-action references as a DAG-style edge list"
+    )]
+    pub dag: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct KeyValueArg {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Args, Clone)]
+#[command(
+    group(
+        ArgGroup::new("run_target")
+            .args(["service", "action"])
+            .required(true)
+            .multiple(false)
+    ),
+    group(
+        ArgGroup::new("hook_selection")
+            .args(["with_all_hooks", "without_hooks", "hook"])
+            .multiple(false)
+    )
+)]
+pub struct RunArgs {
+    #[arg(long, group = "run_target", help = "Run a single configured service")]
+    pub service: Option<String>,
+    #[arg(long, group = "run_target", help = "Run a single configured action")]
+    pub action: Option<String>,
+    #[arg(
+        long,
+        requires = "service",
+        group = "hook_selection",
+        help = "Run all hooks that naturally occur during the single-service lifecycle"
+    )]
+    pub with_all_hooks: bool,
+    #[arg(
+        long,
+        requires = "service",
+        group = "hook_selection",
+        help = "Skip all hooks while running the single service"
+    )]
+    pub without_hooks: bool,
+    #[arg(
+        long = "hook",
+        requires = "service",
+        group = "hook_selection",
+        help = "Run only the selected hook name; may be passed multiple times"
+    )]
+    pub hook: Vec<String>,
+    #[arg(
+        long = "arg",
+        requires = "action",
+        value_parser = parse_key_value_arg,
+        help = "Provide or override a standalone action context value as key=value"
+    )]
+    pub args: Vec<KeyValueArg>,
+}
+
 #[derive(Debug, Args)]
 pub struct DownArgs {
     #[arg(
@@ -94,4 +179,157 @@ pub struct ManagementArgs {
 pub struct DaemonUpArgs {
     #[arg(help = "Internal service target list used by background supervisor mode")]
     pub services: Vec<String>,
+}
+
+fn parse_key_value_arg(input: &str) -> Result<KeyValueArg, String> {
+    let Some((key, value)) = input.split_once('=') else {
+        return Err(format!(
+            "invalid `--arg` value `{input}`; expected key=value"
+        ));
+    };
+
+    if key.is_empty() {
+        return Err(format!(
+            "invalid `--arg` value `{input}`; key must not be empty"
+        ));
+    }
+
+    Ok(KeyValueArg {
+        key: key.to_owned(),
+        value: value.to_owned(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Command};
+
+    #[test]
+    fn list_defaults_to_plain_listing() {
+        let cli = Cli::try_parse_from(["onekey-run", "list"]).unwrap();
+        let Command::List(args) = cli.command else {
+            panic!("expected list command");
+        };
+
+        assert!(!args.all);
+        assert!(!args.services);
+        assert!(!args.actions);
+        assert!(!args.detail);
+        assert!(!args.dag);
+    }
+
+    #[test]
+    fn list_accepts_detail_and_scope_flags() {
+        let cli = Cli::try_parse_from(["onekey-run", "list", "--detail", "--services"]).unwrap();
+        let Command::List(args) = cli.command else {
+            panic!("expected list command");
+        };
+
+        assert!(args.detail);
+        assert!(args.services);
+        assert!(!args.actions);
+        assert!(!args.dag);
+    }
+
+    #[test]
+    fn list_accepts_uppercase_dag_flag() {
+        let cli = Cli::try_parse_from(["onekey-run", "list", "--DAG"]).unwrap();
+        let Command::List(args) = cli.command else {
+            panic!("expected list command");
+        };
+
+        assert!(args.dag);
+    }
+
+    #[test]
+    fn list_rejects_conflicting_detail_and_dag_flags() {
+        let error = Cli::try_parse_from(["onekey-run", "list", "--detail", "--DAG"]).unwrap_err();
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("--detail"));
+        assert!(rendered.contains("--DAG"));
+    }
+
+    #[test]
+    fn run_rejects_service_and_action_together() {
+        let error = Cli::try_parse_from([
+            "onekey-run",
+            "run",
+            "--service",
+            "api",
+            "--action",
+            "prepare",
+        ])
+        .unwrap_err();
+
+        assert!(error.to_string().contains("--action"));
+    }
+
+    #[test]
+    fn run_rejects_conflicting_hook_selection_flags() {
+        let error = Cli::try_parse_from([
+            "onekey-run",
+            "run",
+            "--service",
+            "api",
+            "--with-all-hooks",
+            "--without-hooks",
+        ])
+        .unwrap_err();
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("--with-all-hooks"));
+        assert!(rendered.contains("--without-hooks"));
+    }
+
+    #[test]
+    fn run_accepts_multiple_hooks() {
+        let cli = Cli::try_parse_from([
+            "onekey-run",
+            "run",
+            "--service",
+            "api",
+            "--hook",
+            "before_start",
+            "--hook",
+            "after_start_success",
+        ])
+        .unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+
+        assert_eq!(args.service.as_deref(), Some("api"));
+        assert_eq!(
+            args.hook,
+            vec!["before_start".to_owned(), "after_start_success".to_owned()]
+        );
+    }
+
+    #[test]
+    fn run_accepts_multiple_action_args() {
+        let cli = Cli::try_parse_from([
+            "onekey-run",
+            "run",
+            "--action",
+            "notify",
+            "--arg",
+            "service_name=api",
+            "--arg",
+            "hook_name=manual",
+        ])
+        .unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+
+        assert_eq!(args.action.as_deref(), Some("notify"));
+        assert_eq!(args.args.len(), 2);
+        assert_eq!(args.args[0].key, "service_name");
+        assert_eq!(args.args[0].value, "api");
+        assert_eq!(args.args[1].key, "hook_name");
+        assert_eq!(args.args[1].value, "manual");
+    }
 }
