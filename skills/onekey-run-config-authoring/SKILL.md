@@ -1,6 +1,6 @@
 ---
 name: onekey-run-config-authoring
-description: Create, modify, and repair `onekey-tasks.yaml` files for projects that use `onekey-run-rs` (`onekey-run` CLI). Use when the user needs a new config, wants to adapt a config to a codebase, or needs help with services, actions, hooks, working directories, logging, dependencies, or validation errors.
+description: Create, modify, and repair `onekey-tasks.yaml` files for projects that use `onekey-run-rs` (`onekey-run` CLI). Use when the user needs a new config, wants to adapt a config to a codebase, or needs help with services, actions, hooks, watch settings, working directories, logging, dependencies, list/run debugging, or validation errors.
 ---
 
 # onekey-run config authoring
@@ -16,7 +16,8 @@ Only inspect the user's target project to infer actual services, commands, direc
 - Create a new `onekey-tasks.yaml`
 - Modify an existing `onekey-tasks.yaml`
 - Repair invalid fields, broken dependency wiring, hook references, or log settings
-- Infer `executable`, `args`, `cwd`, env, dependencies, actions, and hooks from a project layout
+- Infer `executable`, `args`, `cwd`, env, dependencies, actions, hooks, and `watch` settings from a project layout
+- Explain or use `list` / `run` when they help inspect or debug a config
 - Keep the config aligned with the current implementation, not an imagined future schema
 
 ## Execution assumption
@@ -94,7 +95,13 @@ Supported `services.<name>` keys:
   - `autostart`
   - `disabled`
   - `log`
+  - `watch`
   - `hooks`
+
+Supported `services.<name>.watch` keys:
+
+- `paths`
+- `debounce_ms`
 
 Supported `services.<name>.hooks` keys:
 
@@ -148,6 +155,9 @@ services:                          # required, must be non-empty
       max_file_bytes: 10485760
       overflow_strategy: "rotate"
       rotate_file_count: 5
+    watch:                         # optional auto-restart on file changes
+      paths: ["./src", "./Cargo.toml"]
+      debounce_ms: 500
     hooks:                         # optional
       before_start: ["prepare-env"]
       after_start_success: []
@@ -169,11 +179,16 @@ services:                          # required, must be non-empty
 - `executable` must not be empty
 - relative `cwd` is resolved relative to the config file directory
 - relative log file paths are resolved relative to the config file directory
+- relative `watch.paths` are resolved relative to the config file directory
 - `depends_on` only controls startup and shutdown order; it is not a health check
 - every dependency in `depends_on` must exist
 - dependency graphs must be acyclic
 - hook-referenced actions must exist and must not be `disabled: true`
 - top-level `log.file` must not resolve to the same absolute path as any `service.log.file`
+- `watch.paths` must be a non-empty array when `watch` exists
+- each resolved `watch.paths[*]` must exist and must resolve to a file, directory, or symlink
+- resolved `watch.paths` must not contain duplicates
+- `watch.debounce_ms` must be greater than `0` when set
 
 ## Defaults and runtime assumptions
 
@@ -181,12 +196,15 @@ services:                          # required, must be non-empty
 - `autostart` defaults to `true`
 - `disabled` defaults to `false`
 - `log.append` defaults to `true`
+- `watch.debounce_ms` defaults to `500`
 - a service is considered started when the process spawns successfully and is still alive
 - the current implementation does not do readiness or health checks
 - shutdown order is the reverse of dependency order
 - `before_start` actions run synchronously and serially before the service process is spawned
 - if any `before_start` action fails or times out, that service does not start, and later dependent services should be treated as blocked by dependency failure
 - process state is judged from process spawn/exit/PID state only; there is no health or readiness probe layer
+- watch restarts only the changed service; it does not cascade to dependents
+- watch-triggered restarts reuse the normal stop/start path and therefore reuse existing hooks
 
 ## Logging model
 
@@ -197,6 +215,7 @@ services:                          # required, must be non-empty
 - `up --tui` shows a terminal monitor and can display logs/events interactively
 - `up -d` starts a background supervisor; its lifecycle should still be discoverable through runtime files and `management`
 - instance and service file paths may be relative; resolve them against the config file directory
+- watch ignores `.onekey-run/`, the top-level instance log, and the current service log to avoid self-trigger loops
 
 Log shape:
 
@@ -329,6 +348,16 @@ Useful user-facing commands:
 onekey-run init
 onekey-run init --full
 onekey-run check -c <path-to-onekey-tasks.yaml>
+onekey-run list
+onekey-run list --services
+onekey-run list --actions
+onekey-run list --detail
+onekey-run list --DAG
+onekey-run run --service <service_name>
+onekey-run run --service <service_name> --with-all-hooks
+onekey-run run --service <service_name> --hook <hook_name>
+onekey-run run --action <action_name>
+onekey-run run --action <action_name> --arg service_name=<service_name>
 onekey-run up -c <path-to-onekey-tasks.yaml>
 onekey-run up --tui -c <path-to-onekey-tasks.yaml>
 onekey-run up -d -c <path-to-onekey-tasks.yaml>
@@ -344,6 +373,11 @@ Important behavior:
 - `-c` / `--config` selects the config file path
 - `init` and `init --full` generate platform-specific presets for the current OS
 - prefer generated templates as the starting point instead of copying Unix-only examples into Windows projects or the reverse
+- `list` reads the validated raw config, so disabled services/actions still appear in output
+- `list --DAG` prints service dependency edges and hook -> action references
+- `run --service <name>` runs only that service; it does not auto-start dependencies
+- `run --service <name>` defaults to `--without-hooks`
+- `run --action <name>` can override placeholder context with repeated `--arg key=value`
 - `down -c ...` resolves runtime state from the config file directory
 - `up -d` starts a background supervisor process
 - `management` lists active instances and can show status summary, runtime duration, and recent event summary
@@ -365,6 +399,7 @@ Practical command policy for this skill:
    - environment variables
    - whether it should autostart
    - whether it depends on another service
+   - whether source changes should restart it via `watch`
    - whether file logging is needed
    - whether hooks should trigger actions
 4. Prefer stable, explicit commands over shell-heavy wrappers when possible.
@@ -384,6 +419,7 @@ Practical command policy for this skill:
   - environment setup is embedded in shell syntax
 - Put project-specific startup directories into `cwd` instead of baking them into command strings.
 - Use `env` only for variables that are really required to start the process.
+- Use `watch` for developer-facing services that should restart on source/config changes; keep `paths` narrow and explicit.
 - On Windows, if a shell wrapper is unavoidable, prefer native Windows command forms such as `cmd` + `["/C", "..."]` instead of copying Unix `sh -c` examples.
 
 Cross-platform authoring rules:
@@ -416,6 +452,7 @@ args:
 - Do not introduce unsupported fields such as `version`, `command`, `healthcheck`, `ready`, or action-specific log fields
 - Do not convert `args` into a single shell string unless the underlying command truly requires a shell
 - Do not assume `restart` is operationally complete; preserve it as config intent unless the user explicitly wants to rely on current behavior
+- Do not use `watch` as a substitute for dependency propagation or readiness checks
 - Prefer `cwd: "."` when the process should run from the config directory
 - Keep service names lowercase and stable
 - Do not invent future-only fields to "prepare for extensibility"
@@ -431,8 +468,9 @@ After editing a config:
 4. Check that all `log` combinations are valid.
 5. Check that top-level and service log files do not collide.
 6. Check that each service and action uses `executable` + `args`, not `command`.
-7. Check that placeholder names are known and hook-compatible.
-8. If possible, validate with one of:
+7. Check that `watch.paths` exist, are non-empty, and do not duplicate the same resolved path.
+8. Check that placeholder names are known and hook-compatible.
+9. If possible, validate with one of:
 
 ```bash
 cargo run -- check -c <path-to-onekey-tasks.yaml>
@@ -579,6 +617,19 @@ services:
       before_start: ["prepare-api"]
 ```
 
+Watch-enabled service:
+
+```yaml
+services:
+  api:
+    executable: "cargo"
+    args: ["run"]
+    cwd: "./backend"
+    watch:
+      paths: ["./backend/src", "./backend/Cargo.toml"]
+      debounce_ms: 500
+```
+
 ## Output style
 
 When you change a config, explain:
@@ -597,4 +648,5 @@ When you change a config, explain:
 - projects where startup commands differ between development and production
 - services that daemonize themselves, because `onekey-run` expects to supervise a foreground process
 - hook actions that depend on hook-specific placeholders or platform-specific shell syntax
+- watch paths that are too broad and accidentally include generated files, logs, or runtime state
 - requests that silently assume health checks, readiness gates, or post-start waiting, because the current model does not provide those
