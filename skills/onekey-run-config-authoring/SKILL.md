@@ -20,6 +20,19 @@ Only inspect the user's target project to infer actual services, commands, direc
 - Explain or use `list` / `run` when they help inspect or debug a config
 - Keep the config aligned with the current implementation, not an imagined future schema
 
+## Scope boundary
+
+This skill may include `onekey-run` CLI usage, but only when that CLI behavior directly helps:
+
+- author a config
+- validate a config
+- inspect resolved config structure
+- debug why a config starts, stops, hooks, logs, or watches the way it does
+
+Do not turn this skill into a full CLI manual.
+Do not duplicate every flag from `--help`.
+Keep only the command behavior that materially helps `onekey-tasks.yaml` authoring and debugging.
+
 ## Execution assumption
 
 - Assume the `onekey-run-rs` executable is already installed somewhere on the user's `PATH`
@@ -360,6 +373,8 @@ onekey-run run --action <action_name>
 onekey-run run --action <action_name> --arg service_name=<service_name>
 onekey-run up -c <path-to-onekey-tasks.yaml>
 onekey-run up --tui -c <path-to-onekey-tasks.yaml>
+onekey-run up --tui --keep -c <path-to-onekey-tasks.yaml>
+onekey-run up --tui --keep --manage -c <path-to-onekey-tasks.yaml>
 onekey-run up -d -c <path-to-onekey-tasks.yaml>
 onekey-run down -c <path-to-onekey-tasks.yaml>
 onekey-run down --force -c <path-to-onekey-tasks.yaml>
@@ -379,6 +394,9 @@ Important behavior:
 - `run --service <name>` defaults to `--without-hooks`
 - `run --action <name>` can override placeholder context with repeated `--arg key=value`
 - `down -c ...` resolves runtime state from the config file directory
+- `up --tui` can monitor logs and events interactively; pressing `R` restarts the selected service
+- `up --tui --keep` keeps the dashboard open after services exit in read-only post-run mode
+- `up --tui --keep --manage` keeps the dashboard open after services exit and allows post-run management actions such as `R`
 - `up -d` starts a background supervisor process
 - `management` lists active instances and can show status summary, runtime duration, and recent event summary
 
@@ -387,6 +405,7 @@ Practical command policy for this skill:
 - when you need to explain usage to the user, prefer `onekey-run ...` examples
 - when you need to invoke the installed binary yourself for validation, use `onekey-run-rs ...`
 - if the installed binary is missing, stop and report; do not continue guessing
+- when documenting CLI behavior inside this skill, keep it scoped to config authoring, validation, and runtime debugging
 
 ## Authoring workflow
 
@@ -645,6 +664,7 @@ When you change a config, explain:
 - monorepos where each service lives in a different subdirectory
 - cross-platform commands that work on Unix-like systems but not Windows
 - projects where the user wants `up -d`, `management`, TUI, or instance/service logging to matter operationally
+- projects where the user expects post-run TUI behavior, because `--keep` is read-only while `--keep --manage` remains interactive
 - projects where startup commands differ between development and production
 - services that daemonize themselves, because `onekey-run` expects to supervise a foreground process
 - hook actions that depend on hook-specific placeholders or platform-specific shell syntax

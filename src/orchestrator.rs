@@ -39,6 +39,8 @@ pub struct RunPlan {
 
 pub struct RunOptions {
     pub tui: bool,
+    pub keep_tui: bool,
+    pub manage_tui: bool,
     pub daemonized: bool,
 }
 
@@ -372,6 +374,7 @@ fn run_single_action(
         &context.hook_name,
         &action.name,
         &prepared.resolved_params,
+        HookOutputMode::Terminal,
     );
 
     match process::run_action(&rendered_action, &context.service_name, &context.hook_name)? {
@@ -415,6 +418,7 @@ fn run_single_service(
                 exit_code: None,
                 exit_status: None,
             },
+            HookOutputMode::Terminal,
         )?;
     }
 
@@ -441,6 +445,7 @@ fn run_single_service(
                         exit_code: None,
                         exit_status: Some(error.to_string()),
                     },
+                    HookOutputMode::Terminal,
                 );
             }
             return Err(error);
@@ -465,6 +470,7 @@ fn run_single_service(
                 exit_code: Some(0),
                 exit_status: Some("running".to_owned()),
             },
+            HookOutputMode::Terminal,
         ) {
             eprintln!("{error}");
         }
@@ -499,6 +505,7 @@ fn run_single_service(
                         exit_code: status.code(),
                         exit_status: Some(status.to_string()),
                     },
+                    HookOutputMode::Terminal,
                 );
             }
             return Err(AppError::runtime_failed(format!(
@@ -537,6 +544,7 @@ fn stop_single_service(
                 exit_code: None,
                 exit_status: None,
             },
+            HookOutputMode::Terminal,
         ) {
             eprintln!("{error}");
         }
@@ -571,6 +579,7 @@ fn stop_single_service(
                     exit_code: None,
                     exit_status: Some("request_stop_failed".to_owned()),
                 },
+                HookOutputMode::Terminal,
             ) {
                 eprintln!("{hook_error}");
             }
@@ -622,6 +631,7 @@ fn stop_single_service(
                         exit_code: None,
                         exit_status: Some("timeout".to_owned()),
                     },
+                    HookOutputMode::Terminal,
                 ) {
                     eprintln!("{error}");
                 }
@@ -654,6 +664,7 @@ fn stop_single_service(
                                 exit_code: None,
                                 exit_status: Some("force_stop_failed".to_owned()),
                             },
+                            HookOutputMode::Terminal,
                         ) {
                             eprintln!("{hook_error}");
                         }
@@ -690,6 +701,7 @@ fn run_single_service_stop_success(
                 exit_code,
                 exit_status: Some(exit_status.to_owned()),
             },
+            HookOutputMode::Terminal,
         ) {
             eprintln!("{error}");
         }
@@ -1116,7 +1128,7 @@ fn install_plan_instance_logger(
 
 pub fn run_up(plan: RunPlan, options: RunOptions) -> AppResult<()> {
     if options.tui {
-        return run_up_tui(plan);
+        return run_up_tui(plan, options.keep_tui, options.manage_tui);
     }
     if options.daemonized {
         return run_up_daemonized(plan);
@@ -1180,7 +1192,8 @@ fn run_up_plain(plan: RunPlan) -> AppResult<()> {
         None,
         format_detail_fields(&[("reason", stop_reason.to_owned())]),
     );
-    let shutdown_result = shutdown_running_services(&mut running, &shutdown, &plan, stop_reason);
+    let shutdown_result =
+        shutdown_running_services(&mut running, &shutdown, &plan, stop_reason, &output_context);
 
     let cleanup_result =
         runtime_state::cleanup_runtime_files(&plan.project_root).and_then(|_| lock.release());
@@ -1205,9 +1218,13 @@ fn run_up_plain(plan: RunPlan) -> AppResult<()> {
     Ok(())
 }
 
-fn run_up_tui(plan: RunPlan) -> AppResult<()> {
+fn run_up_tui(plan: RunPlan, keep_tui: bool, manage_tui: bool) -> AppResult<()> {
+    let _instance_log_guard = install_instance_logger(plan.instance_log.clone())?;
+    let shutdown = install_shutdown_controller()?;
+    let (log_tx, log_rx) = mpsc::channel();
+    let output_context = RuntimeOutputContext::Tui(log_tx.clone());
+
     let lock = RuntimeLock::acquire(&plan.project_root)?;
-    let (lock, _instance_log_guard) = install_plan_instance_logger(&plan, lock)?;
     let mut runtime_state = RuntimeState::new(
         plan.project_root.clone(),
         plan.config_path.clone(),
@@ -1222,15 +1239,13 @@ fn run_up_tui(plan: RunPlan) -> AppResult<()> {
         None,
         format_detail_fields(&[
             ("mode", "tui".to_owned()),
+            ("keep", keep_tui.to_string()),
+            ("manage", manage_tui.to_string()),
             ("config", plan.config_path.display().to_string()),
             ("service_count", plan.services.len().to_string()),
         ]),
     );
 
-    let shutdown = install_shutdown_controller()?;
-
-    let (log_tx, log_rx) = mpsc::channel();
-    let output_context = RuntimeOutputContext::Tui(log_tx.clone());
     let mut running = match start_services(&plan, &mut runtime_state, &output_context) {
         Ok(running) => running,
         Err(error) => {
@@ -1242,14 +1257,14 @@ fn run_up_tui(plan: RunPlan) -> AppResult<()> {
     };
     let mut watch_runtime = WatchRuntime::start(&plan)?;
     runtime_state::register_instance(&runtime_state)?;
-    drop(log_tx);
+    let mut session = crate::tui::DashboardSession::enter(&plan.services, &running)?;
 
-    let runtime_result = crate::tui::run_dashboard(
+    let runtime_result = session.run_running_phase(
         &plan,
         &mut running,
         &mut runtime_state,
         watch_runtime.as_mut(),
-        log_rx,
+        &log_rx,
         shutdown.clone(),
         &output_context,
     );
@@ -1263,7 +1278,26 @@ fn run_up_tui(plan: RunPlan) -> AppResult<()> {
         None,
         format_detail_fields(&[("reason", stop_reason.to_owned())]),
     );
-    let shutdown_result = shutdown_running_services(&mut running, &shutdown, &plan, stop_reason);
+    let shutdown_result =
+        shutdown_running_services(&mut running, &shutdown, &plan, stop_reason, &output_context);
+    running.clear();
+
+    let post_run_phase = if manage_tui {
+        crate::tui::DashboardPhase::PostRunManage
+    } else {
+        crate::tui::DashboardPhase::PostRunReadonly
+    };
+    if keep_tui {
+        session.freeze_post_run(
+            post_run_phase,
+            &plan.project_root,
+            &plan.services,
+            &running,
+            &log_rx,
+            keep_mode_notice(manage_tui),
+        )?;
+    }
+
     let cleanup_result =
         runtime_state::cleanup_runtime_files(&plan.project_root).and_then(|_| lock.release());
     emit_runtime_event(
@@ -1279,11 +1313,179 @@ fn run_up_tui(plan: RunPlan) -> AppResult<()> {
         ]),
     );
 
+    if keep_tui {
+        session.redraw()?;
+        loop {
+            match session.run_post_run_phase(&shutdown)? {
+                crate::tui::PostRunAction::Exit => break,
+                crate::tui::PostRunAction::RestartSelectedService(service_name) => {
+                    if let Err(error) = run_tui_managed_cycle(
+                        &plan,
+                        &service_name,
+                        &mut session,
+                        &shutdown,
+                        &log_tx,
+                        &log_rx,
+                    ) {
+                        session.set_notice(format!(
+                            "failed to start or restart {service_name}: {error}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    session.exit()?;
     runtime_result?;
     shutdown_result?;
     cleanup_result?;
 
     Ok(())
+}
+
+fn keep_mode_notice(manage_tui: bool) -> &'static str {
+    if manage_tui {
+        "post-run manage mode; press R to start or restart the selected service, q or Esc to exit"
+    } else {
+        "post-run view; press q or Esc to exit"
+    }
+}
+
+fn run_tui_managed_cycle(
+    plan: &RunPlan,
+    service_name: &str,
+    session: &mut crate::tui::DashboardSession,
+    shutdown: &ShutdownController,
+    log_tx: &mpsc::Sender<process::LogEvent>,
+    log_rx: &mpsc::Receiver<process::LogEvent>,
+) -> AppResult<()> {
+    shutdown.reset();
+
+    let output_context = RuntimeOutputContext::Tui(log_tx.clone());
+    let lock = RuntimeLock::acquire(&plan.project_root)?;
+    let mut runtime_state = RuntimeState::new(
+        plan.project_root.clone(),
+        plan.config_path.clone(),
+        plan.instance_log.as_ref().map(|log| log.file.clone()),
+    );
+    runtime_state::write_state(&plan.project_root, &runtime_state)?;
+    emit_runtime_event(
+        &plan.project_root,
+        "instance_started",
+        None,
+        None,
+        None,
+        format_detail_fields(&[
+            ("mode", "tui_manage".to_owned()),
+            ("config", plan.config_path.display().to_string()),
+            ("service_count", "1".to_owned()),
+            ("service", service_name.to_owned()),
+        ]),
+    );
+
+    let mut running = Vec::new();
+    let restart_outcome = restart_service(
+        plan,
+        service_name,
+        ServiceRestartTrigger::Tui,
+        &mut running,
+        &mut runtime_state,
+        shutdown,
+        &output_context,
+    )?;
+    match restart_outcome {
+        ServiceRestartOutcome::Restarted => {}
+        ServiceRestartOutcome::Skipped { detail } => {
+            let cleanup_result = runtime_state::cleanup_runtime_files(&plan.project_root)
+                .and_then(|_| lock.release());
+            cleanup_result?;
+            return Err(AppError::runtime_failed(detail));
+        }
+    }
+
+    if let Err(error) = runtime_state::register_instance(&runtime_state) {
+        let shutdown_result = shutdown_running_services(
+            &mut running,
+            shutdown,
+            plan,
+            "register_failure",
+            &output_context,
+        );
+        let cleanup_result =
+            runtime_state::cleanup_runtime_files(&plan.project_root).and_then(|_| lock.release());
+        shutdown_result?;
+        cleanup_result?;
+        return Err(error);
+    }
+
+    session.set_notice(format!("service {service_name} restarted"));
+    let runtime_result = session.run_running_phase(
+        plan,
+        &mut running,
+        &mut runtime_state,
+        None,
+        log_rx,
+        shutdown.clone(),
+        &output_context,
+    );
+
+    let stop_reason = determine_stop_reason(&runtime_result, shutdown, "ctrl_c");
+    emit_runtime_event(
+        &plan.project_root,
+        "instance_stopping",
+        None,
+        None,
+        None,
+        format_detail_fields(&[("reason", stop_reason.to_owned())]),
+    );
+    let shutdown_result =
+        shutdown_running_services(&mut running, shutdown, plan, stop_reason, &output_context);
+    running.clear();
+    session.freeze_post_run(
+        crate::tui::DashboardPhase::PostRunManage,
+        &plan.project_root,
+        &plan.services,
+        &running,
+        log_rx,
+        managed_cycle_notice(service_name, &runtime_result, &shutdown_result),
+    )?;
+    let cleanup_result =
+        runtime_state::cleanup_runtime_files(&plan.project_root).and_then(|_| lock.release());
+    emit_runtime_event(
+        &plan.project_root,
+        "instance_stopped",
+        None,
+        None,
+        None,
+        format_detail_fields(&[
+            ("runtime_ok", runtime_result.is_ok().to_string()),
+            ("shutdown_ok", shutdown_result.is_ok().to_string()),
+            ("cleanup_ok", cleanup_result.is_ok().to_string()),
+        ]),
+    );
+    cleanup_result?;
+    session.redraw()?;
+
+    Ok(())
+}
+
+fn managed_cycle_notice(
+    service_name: &str,
+    runtime_result: &AppResult<()>,
+    shutdown_result: &AppResult<()>,
+) -> String {
+    if let Err(error) = runtime_result {
+        format!(
+            "post-run manage mode; last run for {service_name} ended with error: {error}. press R to try again, q or Esc to exit"
+        )
+    } else if let Err(error) = shutdown_result {
+        format!(
+            "post-run manage mode; shutdown for {service_name} reported an error: {error}. press R to try again, q or Esc to exit"
+        )
+    } else {
+        keep_mode_notice(true).to_owned()
+    }
 }
 
 fn run_up_daemonized(plan: RunPlan) -> AppResult<()> {
@@ -1340,7 +1542,8 @@ fn run_up_daemonized(plan: RunPlan) -> AppResult<()> {
         None,
         format_detail_fields(&[("reason", stop_reason.to_owned())]),
     );
-    let shutdown_result = shutdown_running_services(&mut running, &shutdown, &plan, stop_reason);
+    let shutdown_result =
+        shutdown_running_services(&mut running, &shutdown, &plan, stop_reason, &output_context);
     let cleanup_result =
         runtime_state::cleanup_runtime_files(&plan.project_root).and_then(|_| lock.release());
     emit_runtime_event(
@@ -1790,6 +1993,18 @@ struct PendingWatchRestart {
     ready_at: Instant,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ServiceRestartTrigger {
+    Watch { changed_path: PathBuf },
+    Tui,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ServiceRestartOutcome {
+    Restarted,
+    Skipped { detail: String },
+}
+
 pub struct WatchRuntime {
     raw_rx: mpsc::Receiver<watch::WatchEvent>,
     handles: Vec<WatchHandle>,
@@ -1880,14 +2095,19 @@ impl WatchRuntime {
             while let Some((service_name, pending)) = self.pending.pop_first() {
                 emit_runtime_event(
                     &plan.project_root,
-                    "watch_restart_skipped",
+                    "service_restart_skipped",
                     Some(&service_name),
                     None,
                     None,
-                    format_detail_fields(&[
-                        ("reason", "shutdown".to_owned()),
-                        ("path", pending.changed_path.display().to_string()),
-                    ]),
+                    restart_event_detail(
+                        &ServiceRestartTrigger::Watch {
+                            changed_path: pending.changed_path,
+                        },
+                        &[
+                            ("reason", "shutdown".to_owned()),
+                            ("state", "pending".to_owned()),
+                        ],
+                    ),
                 );
             }
             return Ok(());
@@ -1916,15 +2136,23 @@ impl WatchRuntime {
             ]),
         );
 
-        restart_service_from_watch(
+        restart_service(
             plan,
             &service_name,
-            &pending.changed_path,
+            ServiceRestartTrigger::Watch {
+                changed_path: pending.changed_path,
+            },
             running,
             runtime_state,
             shutdown,
             output_context,
-        )
+        )?;
+
+        Ok(())
+    }
+
+    pub fn clear_pending(&mut self, service_name: &str) {
+        self.pending.remove(service_name);
     }
 }
 
@@ -1974,56 +2202,67 @@ fn collect_ignore_path(
     }
 }
 
-fn restart_service_from_watch(
+pub(crate) fn restart_service(
     plan: &RunPlan,
     service_name: &str,
-    changed_path: &Path,
+    trigger: ServiceRestartTrigger,
     running: &mut Vec<SpawnedProcess>,
     runtime_state: &mut RuntimeState,
     shutdown: &ShutdownController,
     output_context: &RuntimeOutputContext,
-) -> AppResult<()> {
+) -> AppResult<ServiceRestartOutcome> {
     emit_runtime_event(
         &plan.project_root,
-        "watch_restart_requested",
+        "service_restart_requested",
         Some(service_name),
         None,
         None,
-        format_detail_fields(&[("path", changed_path.display().to_string())]),
+        restart_event_detail(&trigger, &[]),
     );
-    emit_plain_watch_notice(
+    emit_restart_notice(
         output_context,
-        &format!(
-            "watch: restarting {} because {} changed",
-            service_name,
-            changed_path.display()
-        ),
+        &trigger,
+        &format_restart_notice(&trigger, service_name, "requested", None),
     );
+
+    if shutdown.shutdown_requested() {
+        let detail = "shutdown in progress".to_owned();
+        emit_runtime_event(
+            &plan.project_root,
+            "service_restart_skipped",
+            Some(service_name),
+            None,
+            None,
+            restart_event_detail(&trigger, &[("reason", "shutdown".to_owned())]),
+        );
+        emit_restart_notice(
+            output_context,
+            &trigger,
+            &format_restart_notice(&trigger, service_name, "skipped", Some(detail.as_str())),
+        );
+        return Ok(ServiceRestartOutcome::Skipped { detail });
+    }
 
     let Some(service) = plan
         .services
         .iter()
         .find(|service| service.name == service_name)
     else {
+        let detail = "service not found".to_owned();
         emit_runtime_event(
             &plan.project_root,
-            "watch_restart_skipped",
+            "service_restart_skipped",
             Some(service_name),
             None,
             None,
-            format_detail_fields(&[
-                ("reason", "service_not_found".to_owned()),
-                ("path", changed_path.display().to_string()),
-            ]),
+            restart_event_detail(&trigger, &[("reason", "service_not_found".to_owned())]),
         );
-        emit_plain_watch_notice(
+        emit_restart_notice(
             output_context,
-            &format!(
-                "watch: skipped restart for {} (service not found)",
-                service_name
-            ),
+            &trigger,
+            &format_restart_notice(&trigger, service_name, "skipped", Some(detail.as_str())),
         );
-        return Ok(());
+        return Ok(ServiceRestartOutcome::Skipped { detail });
     };
 
     if let Some(index) = running
@@ -2037,7 +2276,8 @@ fn restart_service_from_watch(
                 shutdown,
                 &mut force_notice_shown,
                 plan,
-                "watch",
+                trigger.stop_reason(),
+                output_context,
             )
         };
         match stop_result {
@@ -2049,23 +2289,32 @@ fn restart_service_from_watch(
                 runtime_state::write_state(&plan.project_root, runtime_state)?;
             }
             Err(error) => {
+                let detail = error.to_string();
                 emit_runtime_event(
                     &plan.project_root,
-                    "watch_restart_skipped",
+                    "service_restart_skipped",
                     Some(service_name),
                     None,
                     None,
-                    format_detail_fields(&[
-                        ("reason", "stop_failed".to_owned()),
-                        ("path", changed_path.display().to_string()),
-                        ("detail", error.to_string()),
-                    ]),
+                    restart_event_detail(
+                        &trigger,
+                        &[
+                            ("reason", "stop_failed".to_owned()),
+                            ("detail", detail.clone()),
+                        ],
+                    ),
                 );
-                emit_plain_watch_notice(
+                emit_restart_notice(
                     output_context,
-                    &format!("watch: failed to stop {} for restart", service_name),
+                    &trigger,
+                    &format_restart_notice(
+                        &trigger,
+                        service_name,
+                        "skipped",
+                        Some(detail.as_str()),
+                    ),
                 );
-                return Err(error);
+                return Ok(ServiceRestartOutcome::Skipped { detail });
             }
         }
     }
@@ -2073,44 +2322,128 @@ fn restart_service_from_watch(
     match start_service(plan, runtime_state, service, output_context) {
         Ok(spawned) => {
             running.push(spawned);
+            emit_runtime_event(
+                &plan.project_root,
+                "service_restart_succeeded",
+                Some(service_name),
+                None,
+                None,
+                restart_event_detail(&trigger, &[]),
+            );
+            emit_restart_notice(
+                output_context,
+                &trigger,
+                &format_restart_notice(&trigger, service_name, "succeeded", None),
+            );
+            Ok(ServiceRestartOutcome::Restarted)
         }
         Err(error) => {
+            let detail = error.to_string();
             runtime_state
                 .services
                 .retain(|entry| entry.service_name != service_name);
             runtime_state::write_state(&plan.project_root, runtime_state)?;
             emit_runtime_event(
                 &plan.project_root,
-                "watch_restart_skipped",
+                "service_restart_skipped",
                 Some(service_name),
                 None,
                 None,
-                format_detail_fields(&[
-                    ("reason", "start_failed".to_owned()),
-                    ("path", changed_path.display().to_string()),
-                    ("detail", error.to_string()),
-                ]),
-            );
-            emit_plain_watch_notice(
-                output_context,
-                &format!(
-                    "watch: restart of {} failed; waiting for next change",
-                    service_name
+                restart_event_detail(
+                    &trigger,
+                    &[
+                        ("reason", "start_failed".to_owned()),
+                        ("detail", detail.clone()),
+                    ],
                 ),
             );
+            emit_restart_notice(
+                output_context,
+                &trigger,
+                &format_restart_notice(&trigger, service_name, "skipped", Some(detail.as_str())),
+            );
+            Ok(ServiceRestartOutcome::Skipped { detail })
         }
     }
-
-    Ok(())
 }
 
-fn emit_plain_watch_notice(output_context: &RuntimeOutputContext, message: &str) {
-    if !matches!(output_context, RuntimeOutputContext::Plain) {
+fn restart_event_detail(trigger: &ServiceRestartTrigger, extra: &[(&str, String)]) -> String {
+    let mut fields = vec![("trigger", trigger.name().to_owned())];
+    match trigger {
+        ServiceRestartTrigger::Watch { changed_path } => {
+            fields.push(("path", changed_path.display().to_string()));
+        }
+        ServiceRestartTrigger::Tui => {
+            fields.push(("key", "R".to_owned()));
+        }
+    }
+    for (key, value) in extra {
+        fields.push((*key, value.clone()));
+    }
+    format_detail_fields(&fields)
+}
+
+fn emit_restart_notice(
+    output_context: &RuntimeOutputContext,
+    trigger: &ServiceRestartTrigger,
+    message: &str,
+) {
+    if !matches!(trigger, ServiceRestartTrigger::Watch { .. })
+        || !matches!(output_context, RuntimeOutputContext::Plain)
+    {
         return;
     }
 
     print!("\r\x1b[2K");
     println!("{message}");
+}
+
+fn format_restart_notice(
+    trigger: &ServiceRestartTrigger,
+    service_name: &str,
+    phase: &str,
+    detail: Option<&str>,
+) -> String {
+    match trigger {
+        ServiceRestartTrigger::Watch { changed_path } => match phase {
+            "requested" => format!(
+                "watch: restarting {} because {} changed",
+                service_name,
+                changed_path.display()
+            ),
+            "succeeded" => format!("watch: restarted {}", service_name),
+            "skipped" => match detail {
+                Some(detail) => format!("watch: skipped restart for {} ({detail})", service_name),
+                None => format!("watch: skipped restart for {}", service_name),
+            },
+            _ => format!("watch: restart {phase} for {}", service_name),
+        },
+        ServiceRestartTrigger::Tui => match phase {
+            "requested" => format!("restarting {}...", service_name),
+            "succeeded" => format!("service {} restarted", service_name),
+            "skipped" => match detail {
+                Some(detail) => format!("failed to restart {}: {}", service_name, detail),
+                None => format!("failed to restart {}", service_name),
+            },
+            _ => format!("restart {phase} for {}", service_name),
+        },
+    }
+}
+
+impl ServiceRestartTrigger {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Watch { .. } => "watch",
+            Self::Tui => "tui",
+        }
+    }
+
+    fn stop_reason(&self) -> &'static str {
+        match self {
+            Self::Watch { .. } => "watch_restart",
+            Self::Tui => "tui_restart",
+        }
+    }
 }
 
 fn monitor_plain_processes(
@@ -2141,7 +2474,7 @@ fn monitor_plain_processes(
                 if !runtime_state::state_path(&plan.project_root).exists() {
                     return Ok(());
                 }
-                handle_runtime_exit(plan, process, status)?;
+                handle_runtime_exit(plan, process, status, output_context)?;
                 return Err(AppError::runtime_failed(format!(
                     "service `{}` exited with status {status}",
                     process.state.service_name
@@ -2183,6 +2516,7 @@ fn start_service(
             exit_code: None,
             exit_status: None,
         },
+        HookOutputMode::from_runtime_output(output_context),
     ) {
         emit_runtime_event(
             &plan.project_root,
@@ -2217,8 +2551,12 @@ fn start_service(
                         exit_code: None,
                         exit_status: Some(error.to_string()),
                     },
+                    HookOutputMode::from_runtime_output(output_context),
                 ) {
-                    eprintln!("{hook_error}");
+                    report_nonfatal_hook_error(
+                        HookOutputMode::from_runtime_output(output_context),
+                        &hook_error,
+                    );
                 }
                 return Err(error);
             }
@@ -2249,8 +2587,9 @@ fn start_service(
             exit_code: Some(0),
             exit_status: Some("running".to_owned()),
         },
+        HookOutputMode::from_runtime_output(output_context),
     ) {
-        eprintln!("{error}");
+        report_nonfatal_hook_error(HookOutputMode::from_runtime_output(output_context), &error);
     }
     Ok(spawned)
 }
@@ -2270,6 +2609,7 @@ fn start_services(
                     &ShutdownController::force_requested_now(),
                     plan,
                     "startup_failure",
+                    output_context,
                 )?;
                 return Err(error);
             }
@@ -2282,6 +2622,7 @@ fn handle_runtime_exit(
     plan: &RunPlan,
     process: &mut SpawnedProcess,
     status: std::process::ExitStatus,
+    output_context: &RuntimeOutputContext,
 ) -> AppResult<()> {
     emit_runtime_event(
         &plan.project_root,
@@ -2313,8 +2654,9 @@ fn handle_runtime_exit(
             exit_code: status.code(),
             exit_status: Some(status.to_string()),
         },
+        HookOutputMode::from_runtime_output(output_context),
     ) {
-        eprintln!("{error}");
+        report_nonfatal_hook_error(HookOutputMode::from_runtime_output(output_context), &error);
     }
 
     Ok(())
@@ -2344,7 +2686,7 @@ fn monitor_daemon_processes(
                 if !runtime_state::state_path(&plan.project_root).exists() {
                     return Ok(());
                 }
-                handle_runtime_exit(plan, process, status)?;
+                handle_runtime_exit(plan, process, status, output_context)?;
                 return Err(AppError::runtime_failed(format!(
                     "service `{}` exited with status {status}",
                     process.state.service_name
@@ -2391,6 +2733,7 @@ fn shutdown_running_services(
     shutdown: &ShutdownController,
     plan: &RunPlan,
     stop_reason: &str,
+    output_context: &RuntimeOutputContext,
 ) -> AppResult<()> {
     let mut first_error = None;
     let mut force_notice_shown = false;
@@ -2401,6 +2744,7 @@ fn shutdown_running_services(
             &mut force_notice_shown,
             plan,
             stop_reason,
+            output_context,
         ) {
             if first_error.is_none() {
                 first_error = Some(error);
@@ -2421,6 +2765,7 @@ fn stop_spawned_process(
     force_notice_shown: &mut bool,
     plan: &RunPlan,
     stop_reason: &str,
+    output_context: &RuntimeOutputContext,
 ) -> AppResult<()> {
     if process::service_exited(&mut process.child)?.is_some() {
         return Ok(());
@@ -2459,13 +2804,16 @@ fn stop_spawned_process(
             exit_code: None,
             exit_status: None,
         },
+        HookOutputMode::from_runtime_output(output_context),
     ) {
-        eprintln!("{error}");
+        report_nonfatal_hook_error(HookOutputMode::from_runtime_output(output_context), &error);
     }
 
     if shutdown.force_requested() {
         if !*force_notice_shown {
-            eprintln!("second interrupt received, force-stopping services.");
+            if HookOutputMode::from_runtime_output(output_context) == HookOutputMode::Terminal {
+                eprintln!("second interrupt received, force-stopping services.");
+            }
             *force_notice_shown = true;
         }
         force_kill_process(process)?;
@@ -2491,8 +2839,9 @@ fn stop_spawned_process(
                 exit_code: None,
                 exit_status: Some("forced".to_owned()),
             },
+            HookOutputMode::from_runtime_output(output_context),
         ) {
-            eprintln!("{error}");
+            report_nonfatal_hook_error(HookOutputMode::from_runtime_output(output_context), &error);
         }
         return Ok(());
     }
@@ -2509,8 +2858,12 @@ fn stop_spawned_process(
                 exit_code: None,
                 exit_status: Some("request_stop_failed".to_owned()),
             },
+            HookOutputMode::from_runtime_output(output_context),
         ) {
-            eprintln!("{hook_error}");
+            report_nonfatal_hook_error(
+                HookOutputMode::from_runtime_output(output_context),
+                &hook_error,
+            );
         }
         return final_error;
     }
@@ -2539,15 +2892,21 @@ fn stop_spawned_process(
                     exit_code: Some(0),
                     exit_status: Some("graceful".to_owned()),
                 },
+                HookOutputMode::from_runtime_output(output_context),
             ) {
-                eprintln!("{error}");
+                report_nonfatal_hook_error(
+                    HookOutputMode::from_runtime_output(output_context),
+                    &error,
+                );
             }
             return Ok(());
         }
 
         if shutdown.force_requested() {
             if !*force_notice_shown {
-                eprintln!("second interrupt received, force-stopping services.");
+                if HookOutputMode::from_runtime_output(output_context) == HookOutputMode::Terminal {
+                    eprintln!("second interrupt received, force-stopping services.");
+                }
                 *force_notice_shown = true;
             }
             force_kill_process(process)?;
@@ -2573,8 +2932,12 @@ fn stop_spawned_process(
                     exit_code: None,
                     exit_status: Some("forced".to_owned()),
                 },
+                HookOutputMode::from_runtime_output(output_context),
             ) {
-                eprintln!("{error}");
+                report_nonfatal_hook_error(
+                    HookOutputMode::from_runtime_output(output_context),
+                    &error,
+                );
             }
             return Ok(());
         }
@@ -2601,8 +2964,12 @@ fn stop_spawned_process(
                     exit_code: None,
                     exit_status: Some("timeout".to_owned()),
                 },
+                HookOutputMode::from_runtime_output(output_context),
             ) {
-                eprintln!("{error}");
+                report_nonfatal_hook_error(
+                    HookOutputMode::from_runtime_output(output_context),
+                    &error,
+                );
             }
 
             let force_result = force_kill_process(process);
@@ -2630,8 +2997,12 @@ fn stop_spawned_process(
                             exit_code: None,
                             exit_status: Some("timed_out_then_forced".to_owned()),
                         },
+                        HookOutputMode::from_runtime_output(output_context),
                     ) {
-                        eprintln!("{error}");
+                        report_nonfatal_hook_error(
+                            HookOutputMode::from_runtime_output(output_context),
+                            &error,
+                        );
                     }
                     return Ok(());
                 }
@@ -2654,8 +3025,12 @@ fn stop_spawned_process(
                             exit_code: None,
                             exit_status: Some("force_stop_failed".to_owned()),
                         },
+                        HookOutputMode::from_runtime_output(output_context),
                     ) {
-                        eprintln!("{hook_error}");
+                        report_nonfatal_hook_error(
+                            HookOutputMode::from_runtime_output(output_context),
+                            &hook_error,
+                        );
                     }
                     return Err(error);
                 }
@@ -2740,6 +3115,7 @@ fn event_level(event_type: &str) -> &'static str {
         "instance_stopping"
         | "service_stop_timeout"
         | "action_timed_out"
+        | "service_restart_skipped"
         | "watch_restart_skipped" => "WARN",
         _ => "INFO",
     }
@@ -2777,6 +3153,21 @@ struct HookRuntimeExtras {
     stop_reason: Option<String>,
     exit_code: Option<i32>,
     exit_status: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HookOutputMode {
+    Terminal,
+    Silent,
+}
+
+impl HookOutputMode {
+    fn from_runtime_output(output_context: &RuntimeOutputContext) -> Self {
+        match output_context {
+            RuntimeOutputContext::Plain => Self::Terminal,
+            RuntimeOutputContext::Daemon | RuntimeOutputContext::Tui(_) => Self::Silent,
+        }
+    }
 }
 
 fn load_hook_bundle_from_state(state: &runtime_state::RuntimeState) -> Option<HookBundle> {
@@ -2845,11 +3236,14 @@ fn announce_action_params(
     hook_name: &str,
     action_name: &str,
     resolved_params: &BTreeMap<String, String>,
+    output_mode: HookOutputMode,
 ) {
-    println!(
-        "{}",
-        format_action_params_preview(action_name, resolved_params)
-    );
+    if output_mode == HookOutputMode::Terminal {
+        println!(
+            "{}",
+            format_action_params_preview(action_name, resolved_params)
+        );
+    }
     if let Some(project_root) = project_root {
         emit_runtime_event(
             project_root,
@@ -2869,6 +3263,7 @@ fn execute_hook_actions(
     service: &ResolvedServiceConfig,
     hook: HookName,
     extras: HookRuntimeExtras,
+    output_mode: HookOutputMode,
 ) -> AppResult<()> {
     let action_names = service.hooks.actions_for(hook);
     if action_names.is_empty() {
@@ -2938,6 +3333,7 @@ fn execute_hook_actions(
             hook.as_str(),
             &action.name,
             &prepared.resolved_params,
+            output_mode,
         );
 
         match process::run_action(&rendered_action, &service.name, hook.as_str())? {
@@ -3038,6 +3434,7 @@ fn run_hook_with_context(
     service: &ResolvedServiceConfig,
     hook: HookName,
     extras: HookRuntimeExtras,
+    output_mode: HookOutputMode,
 ) -> AppResult<()> {
     execute_hook_actions(
         Some(&plan.project_root),
@@ -3046,6 +3443,7 @@ fn run_hook_with_context(
         service,
         hook,
         extras,
+        output_mode,
     )
 }
 
@@ -3054,6 +3452,7 @@ fn run_hook_with_bundle(
     service: &ResolvedServiceConfig,
     hook: HookName,
     extras: HookRuntimeExtras,
+    output_mode: HookOutputMode,
 ) -> AppResult<()> {
     execute_hook_actions(
         Some(&bundle.project_root),
@@ -3062,7 +3461,14 @@ fn run_hook_with_bundle(
         service,
         hook,
         extras,
+        output_mode,
     )
+}
+
+fn report_nonfatal_hook_error(output_mode: HookOutputMode, error: &AppError) {
+    if output_mode == HookOutputMode::Terminal {
+        eprintln!("{error}");
+    }
 }
 
 fn stop_recorded_service(
@@ -3101,6 +3507,7 @@ fn stop_recorded_service(
                 exit_code: None,
                 exit_status: None,
             },
+            HookOutputMode::Terminal,
         )
     {
         eprintln!("{error}");
@@ -3131,6 +3538,7 @@ fn stop_recorded_service(
                         exit_code: None,
                         exit_status: Some(error.to_string()),
                     },
+                    HookOutputMode::Terminal,
                 )
             {
                 eprintln!("{hook_error}");
@@ -3164,6 +3572,7 @@ fn stop_recorded_service(
                     exit_code: None,
                     exit_status: Some("timeout".to_owned()),
                 },
+                HookOutputMode::Terminal,
             )
         {
             eprintln!("{error}");
@@ -3183,6 +3592,7 @@ fn stop_recorded_service(
                     StopOutcome::Forced => "forced".to_owned(),
                 }),
             },
+            HookOutputMode::Terminal,
         ) {
             eprintln!("{error}");
         }
@@ -3259,9 +3669,20 @@ impl ShutdownController {
         self.signal_count.load(Ordering::SeqCst) >= 2
     }
 
+    fn reset(&self) {
+        self.signal_count.store(0, Ordering::SeqCst);
+    }
+
     fn force_requested_now() -> Self {
         Self {
             signal_count: Arc::new(AtomicU8::new(2)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(signal_count: u8) -> Self {
+        Self {
+            signal_count: Arc::new(AtomicU8::new(signal_count)),
         }
     }
 }
@@ -3402,12 +3823,13 @@ mod tests {
     };
 
     use super::{
-        HookRuntimeExtras, HookSelection, ListRequest, ManagementEntry, RuntimeOutputContext,
+        HookOutputMode, HookRuntimeExtras, HookSelection, ListRequest, ManagementEntry,
+        PendingWatchRestart, RuntimeOutputContext, ServiceRestartOutcome, ServiceRestartTrigger,
         ShutdownController, SingleRunRequest, WatchRuntime, build_run_plan, current_unix_secs,
         emit_runtime_event, format_action_params_preview, format_detail_fields,
-        handle_runtime_exit, install_instance_logger, render_list_output, run_hook_with_context,
-        run_init, shutdown_running_services, standalone_action_context, start_services,
-        summarize_instance_status, summarize_last_event, summarize_service_events,
+        handle_runtime_exit, install_instance_logger, render_list_output, restart_service,
+        run_hook_with_context, run_init, shutdown_running_services, standalone_action_context,
+        start_services, summarize_instance_status, summarize_last_event, summarize_service_events,
     };
 
     #[test]
@@ -3836,6 +4258,7 @@ services:
                 exit_code: None,
                 exit_status: None,
             },
+            HookOutputMode::Terminal,
         );
 
         assert!(result.is_ok(), "{result:?}");
@@ -3865,6 +4288,7 @@ services:
                 exit_code: None,
                 exit_status: None,
             },
+            HookOutputMode::Terminal,
         )
         .unwrap_err();
 
@@ -3895,6 +4319,7 @@ services:
                 exit_code: None,
                 exit_status: None,
             },
+            HookOutputMode::Terminal,
         )
         .unwrap_err();
 
@@ -3933,7 +4358,7 @@ services:
             },
         };
 
-        handle_runtime_exit(&plan, &mut spawned, status).unwrap();
+        handle_runtime_exit(&plan, &mut spawned, status, &RuntimeOutputContext::Plain).unwrap();
 
         let events_raw = fs::read_to_string(runtime_state::events_path(&dir)).unwrap();
         assert!(events_raw.contains("\"event_type\":\"service_runtime_exit_unexpected\""));
@@ -3974,10 +4399,21 @@ services:
 
         assert_ne!(running[0].state.pid, original_pid);
         let stop_reasons = fs::read_to_string(dir.join("stop-reasons.log")).unwrap();
-        assert!(stop_reasons.lines().any(|line| line == "watch"));
+        assert!(stop_reasons.lines().any(|line| line == "watch_restart"));
+        let events_raw = fs::read_to_string(runtime_state::events_path(&dir)).unwrap();
+        assert!(events_raw.contains("\"event_type\":\"service_restart_requested\""));
+        assert!(events_raw.contains("\"event_type\":\"service_restart_succeeded\""));
+        assert!(events_raw.contains("\"detail\":\"trigger=\\\"watch\\\""));
 
         drop(watch_runtime);
-        shutdown_running_services(&mut running, &shutdown, &plan, "test_cleanup").unwrap();
+        shutdown_running_services(
+            &mut running,
+            &shutdown,
+            &plan,
+            "test_cleanup",
+            &output_context,
+        )
+        .unwrap();
         let _ = runtime_state::cleanup_runtime_files(&dir);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -4044,8 +4480,229 @@ services:
         assert_ne!(running[0].state.pid, original_pid);
 
         drop(watch_runtime);
-        shutdown_running_services(&mut running, &shutdown, &plan, "test_cleanup").unwrap();
+        shutdown_running_services(
+            &mut running,
+            &shutdown,
+            &plan,
+            "test_cleanup",
+            &output_context,
+        )
+        .unwrap();
         let _ = runtime_state::cleanup_runtime_files(&dir);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tui_restart_restarts_running_service_and_emits_events() {
+        let dir = temp_dir("tui-restart-running");
+        let config_path = dir.join("onekey-tasks.yaml");
+        fs::write(dir.join("trigger.txt"), "v1\n").unwrap();
+        fs::write(&config_path, watch_restart_config()).unwrap();
+        fs::create_dir_all(dir.join(runtime_state::RUNTIME_DIR)).unwrap();
+
+        let config = ProjectConfig::load(&config_path).unwrap();
+        let plan = build_run_plan(&config, &config_path, &[]).unwrap();
+        let output_context = RuntimeOutputContext::Plain;
+        let mut runtime_state = RuntimeState::new(dir.clone(), config_path.clone(), None);
+        let mut running = start_services(&plan, &mut runtime_state, &output_context).unwrap();
+        let shutdown = test_shutdown_controller();
+        let original_pid = running[0].state.pid;
+
+        let outcome = restart_service(
+            &plan,
+            "api",
+            ServiceRestartTrigger::Tui,
+            &mut running,
+            &mut runtime_state,
+            &shutdown,
+            &output_context,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, ServiceRestartOutcome::Restarted);
+        assert_ne!(running[0].state.pid, original_pid);
+        let stop_reasons = fs::read_to_string(dir.join("stop-reasons.log")).unwrap();
+        assert!(stop_reasons.lines().any(|line| line == "tui_restart"));
+        let events_raw = fs::read_to_string(runtime_state::events_path(&dir)).unwrap();
+        assert!(events_raw.contains("\"event_type\":\"service_restart_requested\""));
+        assert!(events_raw.contains("\"event_type\":\"service_restart_succeeded\""));
+        assert!(events_raw.contains("trigger=\\\"tui\\\""));
+        assert!(events_raw.contains("key=\\\"R\\\""));
+
+        shutdown_running_services(
+            &mut running,
+            &shutdown,
+            &plan,
+            "test_cleanup",
+            &output_context,
+        )
+        .unwrap();
+        let _ = runtime_state::cleanup_runtime_files(&dir);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tui_restart_starts_service_when_not_running() {
+        let dir = temp_dir("tui-restart-stopped");
+        let config_path = dir.join("onekey-tasks.yaml");
+        fs::write(dir.join("trigger.txt"), "v1\n").unwrap();
+        fs::write(&config_path, watch_restart_config()).unwrap();
+        fs::create_dir_all(dir.join(runtime_state::RUNTIME_DIR)).unwrap();
+
+        let config = ProjectConfig::load(&config_path).unwrap();
+        let plan = build_run_plan(&config, &config_path, &[]).unwrap();
+        let output_context = RuntimeOutputContext::Plain;
+        let mut runtime_state = RuntimeState::new(dir.clone(), config_path.clone(), None);
+        runtime_state::write_state(&dir, &runtime_state).unwrap();
+        let mut running = Vec::new();
+        let shutdown = test_shutdown_controller();
+
+        let outcome = restart_service(
+            &plan,
+            "api",
+            ServiceRestartTrigger::Tui,
+            &mut running,
+            &mut runtime_state,
+            &shutdown,
+            &output_context,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, ServiceRestartOutcome::Restarted);
+        assert_eq!(running.len(), 1);
+        assert_eq!(runtime_state.services.len(), 1);
+        let events_raw = fs::read_to_string(runtime_state::events_path(&dir)).unwrap();
+        assert!(events_raw.contains("\"event_type\":\"service_restart_succeeded\""));
+
+        shutdown_running_services(
+            &mut running,
+            &shutdown,
+            &plan,
+            "test_cleanup",
+            &output_context,
+        )
+        .unwrap();
+        let _ = runtime_state::cleanup_runtime_files(&dir);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tui_restart_is_skipped_when_shutdown_requested() {
+        let dir = temp_dir("tui-restart-shutdown");
+        let config_path = dir.join("onekey-tasks.yaml");
+        fs::write(dir.join("trigger.txt"), "v1\n").unwrap();
+        fs::write(&config_path, watch_restart_config()).unwrap();
+        fs::create_dir_all(dir.join(runtime_state::RUNTIME_DIR)).unwrap();
+
+        let config = ProjectConfig::load(&config_path).unwrap();
+        let plan = build_run_plan(&config, &config_path, &[]).unwrap();
+        let output_context = RuntimeOutputContext::Plain;
+        let mut runtime_state = RuntimeState::new(dir.clone(), config_path.clone(), None);
+        runtime_state::write_state(&dir, &runtime_state).unwrap();
+        let mut running = Vec::new();
+        let shutdown = shutdown_requested_controller();
+
+        let outcome = restart_service(
+            &plan,
+            "api",
+            ServiceRestartTrigger::Tui,
+            &mut running,
+            &mut runtime_state,
+            &shutdown,
+            &output_context,
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            ServiceRestartOutcome::Skipped {
+                detail: "shutdown in progress".to_owned(),
+            }
+        );
+        assert!(running.is_empty());
+        let events_raw = fs::read_to_string(runtime_state::events_path(&dir)).unwrap();
+        assert!(events_raw.contains("\"event_type\":\"service_restart_skipped\""));
+        assert!(events_raw.contains("reason=\\\"shutdown\\\""));
+
+        let _ = runtime_state::cleanup_runtime_files(&dir);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tui_restart_start_failure_emits_skip_event() {
+        let dir = temp_dir("tui-restart-start-fail");
+        let config_path = dir.join("onekey-tasks.yaml");
+        fs::write(&config_path, broken_service_config()).unwrap();
+        fs::create_dir_all(dir.join(runtime_state::RUNTIME_DIR)).unwrap();
+
+        let config = ProjectConfig::load(&config_path).unwrap();
+        let plan = build_run_plan(&config, &config_path, &[]).unwrap();
+        let output_context = RuntimeOutputContext::Plain;
+        let mut runtime_state = RuntimeState::new(dir.clone(), config_path.clone(), None);
+        runtime_state::write_state(&dir, &runtime_state).unwrap();
+        let mut running = Vec::new();
+        let shutdown = test_shutdown_controller();
+
+        let outcome = restart_service(
+            &plan,
+            "api",
+            ServiceRestartTrigger::Tui,
+            &mut running,
+            &mut runtime_state,
+            &shutdown,
+            &output_context,
+        )
+        .unwrap();
+
+        match outcome {
+            ServiceRestartOutcome::Restarted => {
+                panic!("expected restart to be skipped after start failure")
+            }
+            ServiceRestartOutcome::Skipped { detail } => {
+                assert!(detail.contains("failed to start service `api`"));
+            }
+        }
+        let events_raw = fs::read_to_string(runtime_state::events_path(&dir)).unwrap();
+        assert!(events_raw.contains("\"event_type\":\"service_restart_skipped\""));
+        assert!(events_raw.contains("reason=\\\"start_failed\\\""));
+
+        let _ = runtime_state::cleanup_runtime_files(&dir);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_pending_restart_removes_only_selected_service() {
+        let dir = temp_dir("clear-pending");
+        let config_path = dir.join("onekey-tasks.yaml");
+        let trigger_path = dir.join("trigger.txt");
+        fs::write(&trigger_path, "v1\n").unwrap();
+        fs::write(&config_path, watch_restart_config()).unwrap();
+
+        let config = ProjectConfig::load(&config_path).unwrap();
+        let plan = build_run_plan(&config, &config_path, &[]).unwrap();
+        let mut watch_runtime = WatchRuntime::start(&plan).unwrap().unwrap();
+
+        watch_runtime.pending.insert(
+            "api".to_owned(),
+            PendingWatchRestart {
+                changed_path: trigger_path,
+                ready_at: Instant::now() + Duration::from_secs(1),
+            },
+        );
+        watch_runtime.pending.insert(
+            "other".to_owned(),
+            PendingWatchRestart {
+                changed_path: dir.join("other.txt"),
+                ready_at: Instant::now() + Duration::from_secs(1),
+            },
+        );
+
+        watch_runtime.clear_pending("api");
+
+        assert!(!watch_runtime.pending.contains_key("api"));
+        assert!(watch_runtime.pending.contains_key("other"));
+
+        drop(watch_runtime);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -4267,6 +4924,12 @@ services:
         }
     }
 
+    fn shutdown_requested_controller() -> ShutdownController {
+        ShutdownController {
+            signal_count: Arc::new(AtomicU8::new(1)),
+        }
+    }
+
     fn wait_for_watch_tick<F>(
         watch_runtime: &mut WatchRuntime,
         plan: &super::RunPlan,
@@ -4317,6 +4980,16 @@ services:
             "powershell -NoProfile -Command \"while ($true) { Start-Sleep -Seconds 1 }\""
                 .to_owned(),
         ]
+    }
+
+    fn broken_service_config() -> &'static str {
+        r#"
+services:
+  api:
+    executable: "__onekey_missing_executable__"
+    args: []
+    cwd: .
+"#
     }
 
     #[cfg(unix)]

@@ -62,6 +62,14 @@ pub struct UpArgs {
         help = "Open the terminal dashboard instead of plain status output"
     )]
     pub tui: bool,
+    #[arg(long, requires = "tui", help = "Keep the TUI open after services exit")]
+    pub keep: bool,
+    #[arg(
+        long,
+        requires = "keep",
+        help = "Allow post-run management actions after services exit"
+    )]
+    pub manage: bool,
     #[arg(
         short = 'd',
         long = "daemon",
@@ -331,5 +339,56 @@ mod tests {
         assert_eq!(args.args[0].value, "api");
         assert_eq!(args.args[1].key, "hook_name");
         assert_eq!(args.args[1].value, "manual");
+    }
+
+    #[test]
+    fn up_rejects_keep_without_tui() {
+        let error = Cli::try_parse_from(["onekey-run", "up", "--keep"]).unwrap_err();
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("--keep"));
+        assert!(rendered.contains("--tui"));
+    }
+
+    #[test]
+    fn up_rejects_manage_without_keep() {
+        let error = Cli::try_parse_from(["onekey-run", "up", "--manage"]).unwrap_err();
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("--manage"));
+        assert!(rendered.contains("--keep"));
+    }
+
+    #[test]
+    fn up_rejects_manage_without_keep_when_tui_enabled() {
+        let error = Cli::try_parse_from(["onekey-run", "up", "--tui", "--manage"]).unwrap_err();
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("--manage"));
+        assert!(rendered.contains("--keep"));
+    }
+
+    #[test]
+    fn up_accepts_keep_with_tui() {
+        let cli = Cli::try_parse_from(["onekey-run", "up", "--tui", "--keep"]).unwrap();
+        let Command::Up(args) = cli.command else {
+            panic!("expected up command");
+        };
+
+        assert!(args.tui);
+        assert!(args.keep);
+        assert!(!args.manage);
+    }
+
+    #[test]
+    fn up_accepts_manage_with_keep() {
+        let cli = Cli::try_parse_from(["onekey-run", "up", "--tui", "--keep", "--manage"]).unwrap();
+        let Command::Up(args) = cli.command else {
+            panic!("expected up command");
+        };
+
+        assert!(args.tui);
+        assert!(args.keep);
+        assert!(args.manage);
     }
 }

@@ -40,6 +40,8 @@ pub fn run(cli: Cli) -> AppResult<()> {
                 plan,
                 orchestrator::RunOptions {
                     tui: args.tui,
+                    keep_tui: args.keep,
+                    manage_tui: args.manage,
                     daemonized: false,
                 },
             )
@@ -55,6 +57,8 @@ pub fn run(cli: Cli) -> AppResult<()> {
                 plan,
                 orchestrator::RunOptions {
                     tui: false,
+                    keep_tui: false,
+                    manage_tui: false,
                     daemonized: true,
                 },
             )

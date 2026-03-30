@@ -2,6 +2,12 @@
 
 本目录用于沉淀已经进入功能设计阶段、但尚未开始编码的专题方案。
 
+暂不进入当前实现序列、但仍需保留的上层规划，统一暂存到 `docs_plan/`。
+当前已暂存两组主题：
+
+- 设备级 / 平台级 panel 控制面规划
+- `onekey-agent` 设备代理规划
+
 和 `docs_dev` 的区别：
 
 - `docs_dev`
@@ -27,3 +33,5 @@
 | `11_list_command_design.md` | 规划新增 `list` 子命令，用于读取配置并列出 `services`、`actions`、详细信息与 DAG 关系 | draft |
 | `12_run_command_design.md` | 规划新增 `run` 子命令，用于单独执行 service 或 action，并明确 standalone action 参数默认值与执行前参数展示规则 | draft |
 | `13_service_watch_design.md` | 规划 `services.<name>.watch` 配置，用于监控文件/目录变化并重启对应 service，明确首版不采用全局 `watches` | draft |
+| `14_tui_service_restart_design.md` | 规划 `--tui` 中选中 service 后按 `R` 触发单 service 重启，复用现有 stop/start、hook、runtime state 与 events 语义 | draft |
+| `15_tui_keep_mode_design.md` | 规划 `up --tui --keep --manage` 分层语义：`keep` 保留只读 post-run，`manage` 让 TUI 在 post-run 中继续作为常驻控制台 | draft |

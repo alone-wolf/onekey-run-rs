@@ -17,90 +17,227 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Wrap};
 use ratatui::{Frame, Terminal};
 
 use crate::error::{AppError, AppResult};
-use crate::orchestrator::{RunPlan, RuntimeOutputContext, ShutdownController, WatchRuntime};
+use crate::orchestrator::{
+    RunPlan, RuntimeOutputContext, ServiceRestartOutcome, ServiceRestartTrigger,
+    ShutdownController, WatchRuntime, restart_service,
+};
 use crate::process::{self, LogEvent, LogStream, SpawnedProcess};
 use crate::runtime_state::{self, RuntimeEvent, RuntimeState};
 
 const MAX_LOG_LINES: usize = 500;
 const MAX_EVENTS: usize = 500;
 
-pub fn run_dashboard(
-    plan: &RunPlan,
-    running: &mut Vec<SpawnedProcess>,
-    runtime_state: &mut RuntimeState,
-    watch_runtime: Option<&mut WatchRuntime>,
-    log_rx: Receiver<LogEvent>,
-    shutdown: ShutdownController,
-    output_context: &RuntimeOutputContext,
-) -> AppResult<()> {
-    let mut terminal = TerminalSession::enter()?;
-    let mut state = DashboardState::new(&plan.services, running);
-    let mut watch_runtime = watch_runtime;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DashboardPhase {
+    Running,
+    PostRunReadonly,
+    PostRunManage,
+}
 
-    let result = loop {
-        state.sync_running(&plan.services, running);
-        state.drain_logs(&log_rx);
-        state.refresh_events(&plan.project_root);
+#[derive(Debug, Eq, PartialEq)]
+pub enum PostRunAction {
+    Exit,
+    RestartSelectedService(String),
+}
 
-        if shutdown.shutdown_requested() {
-            state.set_notice("interrupt received, stopping services. press Ctrl-C again to force.");
-            break Ok(());
-        }
+pub struct DashboardSession {
+    terminal: TerminalSession,
+    state: DashboardState,
+}
 
-        if let Some(watch_runtime) = watch_runtime.as_mut() {
-            watch_runtime.tick(plan, running, runtime_state, &shutdown, output_context)?;
-            state.sync_running(&plan.services, running);
-        }
+impl DashboardSession {
+    pub fn enter(
+        services: &[crate::config::ResolvedServiceConfig],
+        running: &[SpawnedProcess],
+    ) -> AppResult<Self> {
+        Ok(Self {
+            terminal: TerminalSession::enter()?,
+            state: DashboardState::new(services, running),
+        })
+    }
 
-        let mut exit_result = None;
-        for process in running.iter_mut() {
-            if let Some(status) = process::service_exited(&mut process.child)? {
-                let graceful = !runtime_state::state_path(&plan.project_root).exists();
-                state.mark_exited(
-                    &process.state.service_name,
-                    format!("exit status {status}"),
-                    graceful,
+    pub fn run_running_phase(
+        &mut self,
+        plan: &RunPlan,
+        running: &mut Vec<SpawnedProcess>,
+        runtime_state: &mut RuntimeState,
+        watch_runtime: Option<&mut WatchRuntime>,
+        log_rx: &Receiver<LogEvent>,
+        shutdown: ShutdownController,
+        output_context: &RuntimeOutputContext,
+    ) -> AppResult<()> {
+        self.state.set_phase(DashboardPhase::Running);
+        self.terminal.clear()?;
+
+        let mut watch_runtime = watch_runtime;
+
+        loop {
+            self.state.sync_running(&plan.services, running);
+            self.state.drain_logs(log_rx);
+            self.state.refresh_events(&plan.project_root);
+
+            if shutdown.shutdown_requested() {
+                self.state.set_notice(
+                    "interrupt received, stopping services. press Ctrl-C again to force.",
                 );
-                if graceful {
-                    exit_result = Some(Ok(()));
-                } else {
-                    exit_result = Some(Err(AppError::runtime_failed(format!(
+                return Ok(());
+            }
+
+            if let Some(watch_runtime) = watch_runtime.as_mut() {
+                watch_runtime.tick(plan, running, runtime_state, &shutdown, output_context)?;
+                self.state.sync_running(&plan.services, running);
+            }
+
+            for process in running.iter_mut() {
+                if let Some(status) = process::service_exited(&mut process.child)? {
+                    let graceful = !runtime_state::state_path(&plan.project_root).exists();
+                    self.state.mark_exited(
+                        &process.state.service_name,
+                        format!("exit status {status}"),
+                        graceful,
+                    );
+                    if graceful {
+                        return Ok(());
+                    }
+                    return Err(AppError::runtime_failed(format!(
                         "service `{}` exited with status {status}",
                         process.state.service_name
-                    ))));
+                    )));
                 }
-                break;
             }
-        }
-        if let Some(result) = exit_result {
-            break result;
-        }
 
-        terminal.draw(&state)?;
+            self.terminal.draw(&self.state)?;
 
-        if event::poll(Duration::from_millis(150)).map_err(|error| {
-            AppError::runtime_failed(format!("failed to poll TUI events: {error}"))
-        })? {
+            if !event::poll(Duration::from_millis(150)).map_err(|error| {
+                AppError::runtime_failed(format!("failed to poll TUI events: {error}"))
+            })? {
+                continue;
+            }
+
             let event = event::read().map_err(|error| {
                 AppError::runtime_failed(format!("failed to read TUI event: {error}"))
             })?;
-            if state.handle_event(event, &shutdown) {
-                break Ok(());
+            match self.state.handle_event(event, &shutdown) {
+                DashboardCommand::None => {}
+                DashboardCommand::Exit => return Ok(()),
+                DashboardCommand::RestartSelectedService => {
+                    let service_name = self.state.selected_service_name().to_owned();
+                    if service_name.is_empty() {
+                        self.state.set_notice("no service selected.");
+                        continue;
+                    }
+
+                    self.state
+                        .set_notice(format!("restarting {service_name}..."));
+                    let outcome = restart_service(
+                        plan,
+                        &service_name,
+                        ServiceRestartTrigger::Tui,
+                        running,
+                        runtime_state,
+                        &shutdown,
+                        output_context,
+                    )?;
+                    if matches!(outcome, ServiceRestartOutcome::Restarted)
+                        && let Some(watch_runtime) = watch_runtime.as_mut()
+                    {
+                        watch_runtime.clear_pending(&service_name);
+                    }
+                    self.state.sync_running(&plan.services, running);
+                    match outcome {
+                        ServiceRestartOutcome::Restarted => {
+                            self.state
+                                .set_notice(format!("service {service_name} restarted"));
+                        }
+                        ServiceRestartOutcome::Skipped { detail } => {
+                            if detail == "shutdown in progress" {
+                                self.state
+                                    .set_notice("shutdown in progress; restart skipped");
+                            } else {
+                                self.state.set_notice(format!(
+                                    "failed to restart {service_name}: {detail}"
+                                ));
+                            }
+                        }
+                    }
+                    self.terminal.clear()?;
+                    self.terminal.draw(&self.state)?;
+                }
             }
         }
-    };
+    }
 
-    terminal.exit()?;
-    result
+    pub fn freeze_post_run(
+        &mut self,
+        phase: DashboardPhase,
+        project_root: &Path,
+        services: &[crate::config::ResolvedServiceConfig],
+        running: &[SpawnedProcess],
+        log_rx: &Receiver<LogEvent>,
+        notice: impl Into<String>,
+    ) -> AppResult<()> {
+        self.state.drain_logs(log_rx);
+        self.state.sync_running(services, running);
+        self.state.refresh_events(project_root);
+        self.state.set_phase(phase);
+        self.state.set_notice(notice);
+        Ok(())
+    }
+
+    pub fn set_notice(&mut self, notice: impl Into<String>) {
+        self.state.set_notice(notice);
+    }
+
+    pub fn redraw(&mut self) -> AppResult<()> {
+        self.terminal.clear()?;
+        self.terminal.draw(&self.state)
+    }
+
+    pub fn run_post_run_phase(
+        &mut self,
+        shutdown: &ShutdownController,
+    ) -> AppResult<PostRunAction> {
+        loop {
+            self.terminal.draw(&self.state)?;
+
+            if !event::poll(Duration::from_millis(150)).map_err(|error| {
+                AppError::runtime_failed(format!("failed to poll TUI events: {error}"))
+            })? {
+                continue;
+            }
+
+            let event = event::read().map_err(|error| {
+                AppError::runtime_failed(format!("failed to read TUI event: {error}"))
+            })?;
+            match self.state.handle_event(event, shutdown) {
+                DashboardCommand::None => {}
+                DashboardCommand::Exit => return Ok(PostRunAction::Exit),
+                DashboardCommand::RestartSelectedService => {
+                    let service_name = self.state.selected_service_name().to_owned();
+                    if service_name.is_empty() {
+                        self.state.set_notice("no service selected.");
+                        continue;
+                    }
+                    return Ok(PostRunAction::RestartSelectedService(service_name));
+                }
+            }
+        }
+    }
+
+    pub fn exit(&mut self) -> AppResult<()> {
+        self.terminal.exit()
+    }
 }
 
 struct DashboardState {
     services: Vec<ServicePanel>,
     events: VecDeque<RuntimeEvent>,
     main_tab: DashboardTab,
+    phase: DashboardPhase,
     selected: usize,
     log_scroll: usize,
     event_scroll: usize,
+    keys_help: String,
     notice: String,
 }
 
@@ -124,6 +261,13 @@ enum DashboardTab {
     Overview,
     Logs,
     Events,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum DashboardCommand {
+    None,
+    Exit,
+    RestartSelectedService,
 }
 
 impl DashboardState {
@@ -155,11 +299,18 @@ impl DashboardState {
             services,
             events: VecDeque::new(),
             main_tab: DashboardTab::Overview,
+            phase: DashboardPhase::Running,
             selected: 0,
             log_scroll: 0,
             event_scroll: 0,
-            notice: "Up/Down select service | Left/Right/Tab switch panel | j/k or PgUp/PgDn scroll | Home/End jump | q/Esc stop".to_owned(),
+            keys_help: dashboard_keys_help(DashboardPhase::Running).to_owned(),
+            notice: "ready".to_owned(),
         }
+    }
+
+    fn set_phase(&mut self, phase: DashboardPhase) {
+        self.phase = phase;
+        self.keys_help = dashboard_keys_help(phase).to_owned();
     }
 
     fn sync_running(
@@ -254,66 +405,90 @@ impl DashboardState {
         }
     }
 
-    fn handle_event(&mut self, event: Event, shutdown: &ShutdownController) -> bool {
+    fn handle_event(&mut self, event: Event, shutdown: &ShutdownController) -> DashboardCommand {
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => {
-                    self.notice = "graceful stop requested.".to_owned();
-                    true
+                    self.notice = match self.phase {
+                        DashboardPhase::Running => "graceful stop requested.".to_owned(),
+                        DashboardPhase::PostRunReadonly | DashboardPhase::PostRunManage => {
+                            "exiting dashboard.".to_owned()
+                        }
+                    };
+                    DashboardCommand::Exit
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if shutdown.force_requested() {
-                        self.notice = "force stop requested.".to_owned();
-                    } else {
+                    self.notice = match self.phase {
+                        DashboardPhase::Running => {
+                            if shutdown.force_requested() {
+                                "force stop requested.".to_owned()
+                            } else {
+                                "interrupt received, stopping services. press Ctrl-C again to force."
+                                    .to_owned()
+                            }
+                        }
+                        DashboardPhase::PostRunReadonly | DashboardPhase::PostRunManage => {
+                            "dashboard exit requested.".to_owned()
+                        }
+                    };
+                    DashboardCommand::Exit
+                }
+                KeyCode::Char('R') => {
+                    if self.selected_service().is_none() {
+                        self.notice = "no service selected.".to_owned();
+                        DashboardCommand::None
+                    } else if matches!(self.phase, DashboardPhase::PostRunReadonly) {
                         self.notice =
-                            "interrupt received, stopping services. press Ctrl-C again to force."
+                            "post-run view is read-only; restart is only available with --manage."
                                 .to_owned();
+                        DashboardCommand::None
+                    } else {
+                        DashboardCommand::RestartSelectedService
                     }
-                    true
                 }
                 KeyCode::BackTab => {
                     self.select_previous_tab();
-                    false
+                    DashboardCommand::None
                 }
                 KeyCode::Tab | KeyCode::Right => {
                     self.select_next_tab();
-                    false
+                    DashboardCommand::None
                 }
                 KeyCode::Left => {
                     self.select_previous_tab();
-                    false
+                    DashboardCommand::None
                 }
                 KeyCode::Up => {
                     self.select_previous_service();
-                    false
+                    DashboardCommand::None
                 }
                 KeyCode::Down => {
                     self.select_next_service();
-                    false
+                    DashboardCommand::None
                 }
                 KeyCode::PageUp => {
                     self.scroll_current_panel_up(10);
-                    false
+                    DashboardCommand::None
                 }
                 KeyCode::PageDown => {
                     self.scroll_current_panel_down(10);
-                    false
+                    DashboardCommand::None
                 }
                 KeyCode::Home => {
                     self.scroll_current_panel_to_oldest();
-                    false
+                    DashboardCommand::None
                 }
                 KeyCode::End => {
                     self.scroll_current_panel_to_latest();
-                    false
+                    DashboardCommand::None
                 }
                 KeyCode::Char('k') => {
                     self.scroll_current_panel_up(1);
-                    false
+                    DashboardCommand::None
                 }
                 KeyCode::Char('j') => {
                     self.scroll_current_panel_down(1);
-                    false
+                    DashboardCommand::None
                 }
                 KeyCode::Char(ch) if ch.is_ascii_digit() => {
                     let index = ch.to_digit(10).unwrap_or(0) as usize;
@@ -321,11 +496,11 @@ impl DashboardState {
                         self.selected = index - 1;
                         self.log_scroll = 0;
                     }
-                    false
+                    DashboardCommand::None
                 }
-                _ => false,
+                _ => DashboardCommand::None,
             },
-            _ => false,
+            _ => DashboardCommand::None,
         }
     }
 
@@ -335,14 +510,18 @@ impl DashboardState {
             .constraints([
                 Constraint::Length(3),
                 Constraint::Min(12),
-                Constraint::Length(3),
+                Constraint::Length(4),
             ])
             .split(frame.area());
 
         self.render_header(frame, chunks[0]);
         self.render_body(frame, chunks[1]);
 
-        let footer = Paragraph::new(self.notice.as_str()).block(
+        let footer = Paragraph::new(vec![
+            Line::from(self.keys_help.as_str()),
+            Line::from(format!("Notice: {}", self.notice)),
+        ])
+        .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title("Keys / Notice"),
@@ -479,6 +658,7 @@ impl DashboardState {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
+            Span::raw(format!("  mode {}", self.phase.label())),
             Span::raw(format!(
                 "  services {}/{} running",
                 self.running_count(),
@@ -760,6 +940,12 @@ impl DashboardState {
             .map(|event| {
                 let color = if event.event_type.starts_with("watch_") {
                     Color::Magenta
+                } else if event.event_type == "service_restart_requested" {
+                    Color::Blue
+                } else if event.event_type == "service_restart_succeeded" {
+                    Color::Green
+                } else if event.event_type == "service_restart_skipped" {
+                    Color::Yellow
                 } else if event.event_type.contains("failed") {
                     Color::Red
                 } else if event.event_type.contains("timeout") {
@@ -824,6 +1010,16 @@ impl DashboardState {
     }
 }
 
+impl DashboardPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::PostRunReadonly => "post-run",
+            Self::PostRunManage => "manage",
+        }
+    }
+}
+
 impl ServiceStatus {
     fn label(&self) -> &str {
         match self {
@@ -845,6 +1041,20 @@ impl ServiceStatus {
             Self::Running => Color::Green,
             Self::Stopped(_) => Color::Yellow,
             Self::Failed(_) => Color::Red,
+        }
+    }
+}
+
+fn dashboard_keys_help(phase: DashboardPhase) -> &'static str {
+    match phase {
+        DashboardPhase::Running => {
+            "Up/Down select service | Left/Right/Tab switch panel | j/k or PgUp/PgDn scroll | Home/End jump | R restart service | q/Esc stop"
+        }
+        DashboardPhase::PostRunReadonly => {
+            "Up/Down select service | Left/Right/Tab switch panel | j/k or PgUp/PgDn scroll | Home/End jump | q/Esc exit"
+        }
+        DashboardPhase::PostRunManage => {
+            "Up/Down select service | Left/Right/Tab switch panel | j/k or PgUp/PgDn scroll | Home/End jump | R start or restart service | q/Esc exit"
         }
     }
 }
@@ -886,6 +1096,12 @@ impl TerminalSession {
             .map_err(|error| AppError::runtime_failed(format!("failed to draw TUI: {error}")))
     }
 
+    fn clear(&mut self) -> AppResult<()> {
+        self.terminal
+            .clear()
+            .map_err(|error| AppError::runtime_failed(format!("failed to clear terminal: {error}")))
+    }
+
     fn exit(&mut self) -> AppResult<()> {
         if self.active {
             disable_raw_mode().map_err(|error| {
@@ -911,5 +1127,159 @@ impl Drop for TerminalSession {
             let _ = self.terminal.show_cursor();
             self.active = false;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+    use super::{
+        DashboardCommand, DashboardPhase, DashboardState, DashboardTab, ServicePanel,
+        ServiceStatus, dashboard_keys_help,
+    };
+    use crate::orchestrator::ShutdownController;
+    use crate::runtime_state::{self, RuntimeEvent};
+
+    #[test]
+    fn restart_key_maps_to_restart_command_in_running_phase() {
+        let mut state = dashboard_state(DashboardPhase::Running);
+
+        let command = state.handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT)),
+            &test_shutdown_controller(),
+        );
+
+        assert_eq!(command, DashboardCommand::RestartSelectedService);
+    }
+
+    #[test]
+    fn restart_key_is_blocked_in_post_run_readonly() {
+        let mut state = dashboard_state(DashboardPhase::PostRunReadonly);
+
+        let command = state.handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT)),
+            &test_shutdown_controller(),
+        );
+
+        assert_eq!(command, DashboardCommand::None);
+        assert!(state.notice.contains("read-only"));
+    }
+
+    #[test]
+    fn restart_key_maps_to_restart_command_in_post_run_manage() {
+        let mut state = dashboard_state(DashboardPhase::PostRunManage);
+
+        let command = state.handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT)),
+            &test_shutdown_controller(),
+        );
+
+        assert_eq!(command, DashboardCommand::RestartSelectedService);
+    }
+
+    #[test]
+    fn phase_updates_keys_help() {
+        let mut state = dashboard_state(DashboardPhase::Running);
+
+        state.set_phase(DashboardPhase::PostRunReadonly);
+        assert_eq!(
+            state.keys_help,
+            dashboard_keys_help(DashboardPhase::PostRunReadonly)
+        );
+
+        state.set_phase(DashboardPhase::PostRunManage);
+        assert_eq!(
+            state.keys_help,
+            dashboard_keys_help(DashboardPhase::PostRunManage)
+        );
+    }
+
+    #[test]
+    fn post_run_snapshot_survives_runtime_file_cleanup() {
+        let project_root = temp_dir("tui-post-run-snapshot");
+        fs::create_dir_all(project_root.join(runtime_state::RUNTIME_DIR)).unwrap();
+
+        runtime_state::append_event(
+            &project_root,
+            &RuntimeEvent {
+                timestamp_unix_secs: 1,
+                event_type: "instance_stopped".to_owned(),
+                service_name: Some("api".to_owned()),
+                hook_name: None,
+                action_name: None,
+                detail: "done".to_owned(),
+            },
+        )
+        .unwrap();
+
+        let mut state = dashboard_state(DashboardPhase::Running);
+        state.refresh_events(&project_root);
+        state.set_phase(DashboardPhase::PostRunReadonly);
+        state.set_notice("post-run view; press q or Esc to exit");
+
+        runtime_state::cleanup_runtime_files(&project_root).unwrap();
+
+        assert_eq!(state.events.len(), 1);
+        assert_eq!(state.events[0].event_type, "instance_stopped");
+        assert_eq!(
+            state.render_event_lines(10, 0)[0].spans[0].content.as_ref(),
+            "[1] instance_stopped"
+        );
+
+        let _ = fs::remove_dir_all(project_root);
+    }
+
+    #[test]
+    fn quit_keys_map_to_exit_command() {
+        let mut state = dashboard_state(DashboardPhase::Running);
+
+        let command = state.handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+            &test_shutdown_controller(),
+        );
+        assert_eq!(command, DashboardCommand::Exit);
+
+        let command = state.handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            &test_shutdown_controller(),
+        );
+        assert_eq!(command, DashboardCommand::Exit);
+    }
+
+    fn dashboard_state(phase: DashboardPhase) -> DashboardState {
+        DashboardState {
+            services: vec![ServicePanel {
+                name: "api".to_owned(),
+                pid: 123,
+                watching: true,
+                status: ServiceStatus::Running,
+                last_watch_event: None,
+                logs: Default::default(),
+            }],
+            events: Default::default(),
+            main_tab: DashboardTab::Overview,
+            phase,
+            selected: 0,
+            log_scroll: 0,
+            event_scroll: 0,
+            keys_help: dashboard_keys_help(phase).to_owned(),
+            notice: String::new(),
+        }
+    }
+
+    fn test_shutdown_controller() -> ShutdownController {
+        ShutdownController::for_test(0)
+    }
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("onekey-run-rs-{label}-{unique}"))
     }
 }
