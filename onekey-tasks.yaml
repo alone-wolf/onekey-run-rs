@@ -47,6 +47,12 @@ services:
     - '30'
     cwd: .
     env:
+      JAVA_TOOL_OPTIONS:
+        separator: ' '
+        parts:
+        - -Dspring.profiles.active=dev
+        - -Dfile.encoding=UTF-8
+        - -XX:+UseContainerSupport
       RUST_LOG: info
     restart: no
     stop_signal: term
@@ -61,8 +67,7 @@ services:
       rotate_file_count: 5
     watch:
       paths:
-      - ./src
-      - ./Cargo.toml
+      - .
       debounce_ms: 500
     hooks:
       before_start:

@@ -40,6 +40,21 @@ pub enum RestartPolicy {
     Always,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(untagged)]
+pub enum EnvValueConfig {
+    String(String),
+    ConcatObject(EnvConcatConfig),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct EnvConcatConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub separator: Option<String>,
+    pub parts: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
@@ -49,7 +64,7 @@ pub struct ServiceConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub env: BTreeMap<String, String>,
+    pub env: BTreeMap<String, EnvValueConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -89,7 +104,7 @@ pub struct ActionConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub env: BTreeMap<String, String>,
+    pub env: BTreeMap<String, EnvValueConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -389,7 +404,18 @@ impl ProjectConfig {
         );
 
         let mut app_env = BTreeMap::new();
-        app_env.insert("RUST_LOG".to_owned(), "info".to_owned());
+        app_env.insert("RUST_LOG".to_owned(), EnvValueConfig::from("info"));
+        app_env.insert(
+            "JAVA_TOOL_OPTIONS".to_owned(),
+            EnvValueConfig::ConcatObject(EnvConcatConfig {
+                separator: Some(" ".to_owned()),
+                parts: vec![
+                    "-Dspring.profiles.active=dev".to_owned(),
+                    "-Dfile.encoding=UTF-8".to_owned(),
+                    "-XX:+UseContainerSupport".to_owned(),
+                ],
+            }),
+        );
 
         let mut services = BTreeMap::new();
         services.insert(
@@ -521,7 +547,18 @@ impl ProjectConfig {
         );
 
         let mut app_env = BTreeMap::new();
-        app_env.insert("RUST_LOG".to_owned(), "info".to_owned());
+        app_env.insert("RUST_LOG".to_owned(), EnvValueConfig::from("info"));
+        app_env.insert(
+            "JAVA_TOOL_OPTIONS".to_owned(),
+            EnvValueConfig::ConcatObject(EnvConcatConfig {
+                separator: Some(" ".to_owned()),
+                parts: vec![
+                    "-Dspring.profiles.active=dev".to_owned(),
+                    "-Dfile.encoding=UTF-8".to_owned(),
+                    "-XX:+UseContainerSupport".to_owned(),
+                ],
+            }),
+        );
 
         let mut services = BTreeMap::new();
         services.insert(
@@ -655,6 +692,10 @@ impl ProjectConfig {
             if let Err(error) = validate_placeholders(&action.args) {
                 errors.push(format!("action `{name}` args {error}"));
             }
+
+            if let Err(error) = validate_env_map(&format!("action `{name}`"), &action.env) {
+                errors.push(error.to_string());
+            }
         }
 
         for (name, service) in &self.services {
@@ -686,6 +727,10 @@ impl ProjectConfig {
                 && let Err(error) =
                     validate_service_watch_config(&format!("service `{name}`"), watch, config_root)
             {
+                errors.push(error.to_string());
+            }
+
+            if let Err(error) = validate_env_map(&format!("service `{name}`"), &service.env) {
                 errors.push(error.to_string());
             }
 
@@ -818,7 +863,7 @@ impl ProjectConfig {
             executable: service.executable.clone(),
             args: service.args.clone(),
             cwd,
-            env: service.env.clone(),
+            env: resolve_env_map(&service.env),
             depends_on: service.depends_on.clone(),
             hooks: service.hooks.clone(),
             stop_signal: service.stop_signal.clone(),
@@ -860,7 +905,7 @@ impl ProjectConfig {
                     executable: action.executable.clone(),
                     args: action.args.clone(),
                     cwd,
-                    env: action.env.clone(),
+                    env: resolve_env_map(&action.env),
                     timeout_secs: action.timeout_secs,
                 },
             );
@@ -922,6 +967,54 @@ impl ProjectConfig {
 impl ServiceConfig {
     fn is_disabled(&self) -> bool {
         self.disabled.unwrap_or(false)
+    }
+}
+
+impl EnvValueConfig {
+    pub(crate) fn render(&self) -> String {
+        match self {
+            Self::String(value) => value.clone(),
+            Self::ConcatObject(config) => config.render(),
+        }
+    }
+
+    pub(crate) fn format_compact(&self) -> String {
+        match self {
+            Self::String(value) => format!("{value:?}"),
+            Self::ConcatObject(config) => config.format_compact(),
+        }
+    }
+}
+
+impl EnvConcatConfig {
+    fn render(&self) -> String {
+        let separator = self.separator.clone().unwrap_or_default();
+        self.parts
+            .iter()
+            .filter(|part| !part.is_empty())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(&separator)
+    }
+
+    fn format_compact(&self) -> String {
+        format!(
+            "{{ separator: {:?}, parts: {:?} }}",
+            self.separator.as_deref().unwrap_or(""),
+            self.parts
+        )
+    }
+}
+
+impl From<String> for EnvValueConfig {
+    fn from(value: String) -> Self {
+        Self::String(value)
+    }
+}
+
+impl From<&str> for EnvValueConfig {
+    fn from(value: &str) -> Self {
+        Self::String(value.to_owned())
     }
 }
 
@@ -1144,6 +1237,13 @@ fn resolve_path(project_root: &Path, path: &Path) -> PathBuf {
     }
 }
 
+fn resolve_env_map(values: &BTreeMap<String, EnvValueConfig>) -> BTreeMap<String, String> {
+    values
+        .iter()
+        .map(|(key, value)| (key.clone(), value.render()))
+        .collect()
+}
+
 fn default_log_append() -> bool {
     true
 }
@@ -1201,6 +1301,34 @@ fn validate_log_config(owner_label: &str, log: &LogConfig) -> AppResult<()> {
             "{owner_label} log.rotate_file_count requires log.overflow_strategy = `rotate`"
         ))),
     }
+}
+
+fn validate_env_map(owner_label: &str, values: &BTreeMap<String, EnvValueConfig>) -> AppResult<()> {
+    for (key, value) in values {
+        validate_env_value(owner_label, key, value)?;
+    }
+
+    Ok(())
+}
+
+fn validate_env_value(owner_label: &str, key: &str, value: &EnvValueConfig) -> AppResult<()> {
+    let EnvValueConfig::ConcatObject(config) = value else {
+        return Ok(());
+    };
+
+    if config.parts.is_empty() {
+        return Err(AppError::config_invalid(format!(
+            "{owner_label} env `{key}` parts must be a non-empty string array"
+        )));
+    }
+
+    if config.separator.as_deref() == Some("path-list") {
+        return Err(AppError::config_invalid(format!(
+            "{owner_label} env `{key}` separator `path-list` is not supported in phase 1"
+        )));
+    }
+
+    Ok(())
 }
 
 fn validate_service_watch_config(
@@ -1448,7 +1576,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{ActionRenderContext, HookName, ProjectConfig};
+    use super::{ActionRenderContext, EnvConcatConfig, EnvValueConfig, HookName, ProjectConfig};
 
     #[test]
     fn rejects_dependency_cycles() {
@@ -1802,6 +1930,17 @@ services:
         let loaded = ProjectConfig::load(&path).unwrap();
         assert_eq!(loaded.services.len(), 2);
         assert_eq!(loaded.actions.len(), 4);
+        assert_eq!(
+            loaded.services["app"].env["JAVA_TOOL_OPTIONS"],
+            EnvValueConfig::ConcatObject(EnvConcatConfig {
+                separator: Some(" ".to_owned()),
+                parts: vec![
+                    "-Dspring.profiles.active=dev".to_owned(),
+                    "-Dfile.encoding=UTF-8".to_owned(),
+                    "-XX:+UseContainerSupport".to_owned(),
+                ],
+            })
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -1842,8 +1981,148 @@ services:
         let loaded = ProjectConfig::load(&path).unwrap();
         assert_eq!(loaded.services["app"].executable, "cmd");
         assert_eq!(loaded.actions["prepare-app"].executable, "cmd");
+        assert_eq!(
+            loaded.services["app"].env["JAVA_TOOL_OPTIONS"],
+            EnvValueConfig::ConcatObject(EnvConcatConfig {
+                separator: Some(" ".to_owned()),
+                parts: vec![
+                    "-Dspring.profiles.active=dev".to_owned(),
+                    "-Dfile.encoding=UTF-8".to_owned(),
+                    "-XX:+UseContainerSupport".to_owned(),
+                ],
+            })
+        );
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resolves_service_env_concat_object() {
+        let dir = temp_dir("service-env-concat");
+        let raw = r#"
+services:
+  api:
+    executable: "sleep"
+    env:
+      JAVA_TOOL_OPTIONS:
+        separator: " "
+        parts:
+          - "-Done=true"
+          - ""
+          - "-Dtwo=false"
+"#;
+
+        let config: ProjectConfig = serde_yaml::from_str(raw).unwrap();
+        config.validate(&dir.join("onekey-tasks.yaml")).unwrap();
+        let resolved = config.resolve_service("api", &dir).unwrap();
+
+        assert_eq!(
+            resolved.env["JAVA_TOOL_OPTIONS"],
+            "-Done=true -Dtwo=false"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resolves_action_env_concat_object() {
+        let dir = temp_dir("action-env-concat");
+        let raw = r#"
+actions:
+  prepare:
+    executable: "echo"
+    env:
+      IMAGE_TAG:
+        parts:
+          - "release-"
+          - "2026"
+          - "0402"
+services:
+  api:
+    executable: "sleep"
+"#;
+
+        let config: ProjectConfig = serde_yaml::from_str(raw).unwrap();
+        config.validate(&dir.join("onekey-tasks.yaml")).unwrap();
+        let resolved = config.resolve_actions(&dir).unwrap();
+
+        assert_eq!(resolved["prepare"].env["IMAGE_TAG"], "release-20260402");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rejects_empty_env_concat_parts() {
+        let raw = r#"
+services:
+  api:
+    executable: "sleep"
+    env:
+      JAVA_TOOL_OPTIONS:
+        separator: " "
+        parts: []
+"#;
+
+        let config: ProjectConfig = serde_yaml::from_str(raw).unwrap();
+        let error = config.validate("onekey-tasks.yaml".as_ref()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("service `api` env `JAVA_TOOL_OPTIONS` parts must be a non-empty string array")
+        );
+    }
+
+    #[test]
+    fn rejects_phase_one_path_list_separator() {
+        let raw = r#"
+services:
+  api:
+    executable: "sleep"
+    env:
+      PATH:
+        separator: "path-list"
+        parts:
+          - "./bin"
+"#;
+
+        let config: ProjectConfig = serde_yaml::from_str(raw).unwrap();
+        let error = config.validate("onekey-tasks.yaml".as_ref()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("service `api` env `PATH` separator `path-list` is not supported in phase 1")
+        );
+    }
+
+    #[test]
+    fn rejects_non_string_env_concat_parts_at_parse_time() {
+        let raw = r#"
+services:
+  api:
+    executable: "sleep"
+    env:
+      JAVA_TOOL_OPTIONS:
+        separator: " "
+        parts:
+          - 123
+"#;
+
+        let error = serde_yaml::from_str::<ProjectConfig>(raw).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("did not match any variant")
+                || message.contains("invalid type")
+                || message.contains("EnvValueConfig")
+        );
+    }
+
+    #[test]
+    fn preset_full_yaml_includes_env_concat_example() {
+        let raw = ProjectConfig::preset_full().to_yaml_string().unwrap();
+
+        assert!(raw.contains("JAVA_TOOL_OPTIONS:"));
+        assert!(raw.contains("separator:"));
+        assert!(raw.contains("parts:"));
     }
 
     fn temp_dir(prefix: &str) -> PathBuf {

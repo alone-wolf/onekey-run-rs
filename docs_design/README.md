@@ -35,3 +35,4 @@
 | `13_service_watch_design.md` | 规划 `services.<name>.watch` 配置，用于监控文件/目录变化并重启对应 service，明确首版不采用全局 `watches` | draft |
 | `14_tui_service_restart_design.md` | 规划 `--tui` 中选中 service 后按 `R` 触发单 service 重启，复用现有 stop/start、hook、runtime state 与 events 语义 | draft |
 | `15_tui_keep_mode_design.md` | 规划 `up --tui --keep --manage` 分层语义：`keep` 保留只读 post-run，`manage` 让 TUI 在 post-run 中继续作为常驻控制台 | draft |
+| `16_env_concat_design.md` | 规划 `services[*].env` / `actions[*].env` 的长值分段拼接能力，明确不采用重复 key，而采用单 key + `parts` 数组的结构化对象 | draft |

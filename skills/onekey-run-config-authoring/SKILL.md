@@ -127,6 +127,24 @@ Supported `services.<name>.hooks` keys:
 - `after_stop_failure`
 - `after_runtime_exit_unexpected`
 
+`env` value shape for both `actions.<name>.env` and `services.<name>.env`:
+
+- plain string, for example:
+  - `RUST_LOG: "info"`
+- phase-1 concat object, for example:
+  - `JAVA_TOOL_OPTIONS:`
+    - `separator: " "`
+    - `parts: ["-Done=true", "-Dtwo=false"]`
+
+Phase-1 `env` concat limits:
+
+- `parts` must be a non-empty string array
+- only `separator` and `parts` are supported in the object
+- `parts[*]` must not be an object
+- `{ env: "PATH" }` is not supported
+- `{ path: "./bin" }` is not supported
+- `separator: "path-list"` is not supported
+
 Compact schema reference:
 
 ```yaml
@@ -146,7 +164,8 @@ actions:                           # optional map
     executable: "python3"          # required
     args: ["scripts/prepare.py"]   # optional
     cwd: "."                       # optional
-    env: {}                        # optional
+    env:                           # optional
+      PYTHONWARNINGS: "default"
     timeout_secs: 30               # optional
     disabled: false                # optional
 
@@ -155,7 +174,11 @@ services:                          # required, must be non-empty
     executable: "cargo"            # required
     args: ["run"]                  # optional
     cwd: "./backend"               # optional
-    env: {}                        # optional
+    env:                           # optional
+      RUST_LOG: "info"
+      JAVA_TOOL_OPTIONS:
+        separator: " "
+        parts: ["-Done=true", "-Dtwo=false"]
     depends_on: ["db"]             # optional
     restart: "no"                  # optional: no | on-failure | always
     stop_signal: "term"            # optional
@@ -202,6 +225,8 @@ services:                          # required, must be non-empty
 - each resolved `watch.paths[*]` must exist and must resolve to a file, directory, or symlink
 - resolved `watch.paths` must not contain duplicates
 - `watch.debounce_ms` must be greater than `0` when set
+- when a single env value becomes long, prefer `{ separator, parts }` over cramming one very long string into one line
+- do not suggest future env concat syntax that the current implementation does not support
 
 ## Defaults and runtime assumptions
 
@@ -563,6 +588,11 @@ services:
     cwd: "./backend"
     env:
       RUST_LOG: "info"
+      JAVA_TOOL_OPTIONS:
+        separator: " "
+        parts:
+          - "-Dspring.profiles.active=dev"
+          - "-Dfile.encoding=UTF-8"
     log:
       file: "./logs/app.log"
       append: true

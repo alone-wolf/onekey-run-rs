@@ -210,7 +210,8 @@
   - `executable`
   - `args`
   - `cwd`
-  - `env`
+  - `env`（原始配置视图）
+  - `resolved_env`（合并后的最终 env 视图）
   - `depends_on`
   - `restart`
   - `stop_signal`
@@ -224,10 +225,11 @@
   - `executable`
   - `args`
   - `cwd`
-  - `env`
+  - `env`（原始配置视图）
+  - `resolved_env`（合并后的最终 env 视图）
   - `timeout_secs`
   - `disabled`
-- 首版以原始配置值展示为主
+- 当原始配置包含结构化 env 值时，detail 输出应至少包含 merged env，避免用户无法直接看到最终生效值
 
 #### 完成标准
 

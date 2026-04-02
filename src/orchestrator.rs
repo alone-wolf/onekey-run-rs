@@ -16,7 +16,7 @@ use serde::Serialize;
 
 use crate::cli::{KeyValueArg, ListArgs, RunArgs};
 use crate::config::{
-    ActionConfig, ActionRenderContext, HookName, LogConfig, LogOverflowStrategy,
+    ActionConfig, ActionRenderContext, EnvValueConfig, HookName, LogConfig, LogOverflowStrategy,
     PreparedActionExecution, ProjectConfig, ResolvedActionConfig, ResolvedLogConfig,
     ResolvedServiceConfig, RestartPolicy, ServiceConfig, ServiceWatchConfig,
     is_known_placeholder_name,
@@ -902,6 +902,11 @@ fn append_service_detail(output: &mut String, name: &str, service: &ServiceConfi
         format_optional_path(service.cwd.as_ref())
     );
     let _ = writeln!(output, "  env: {}", format_string_map(&service.env));
+    let _ = writeln!(
+        output,
+        "  resolved_env: {}",
+        format_resolved_env_map(&service.env)
+    );
     let _ = writeln!(output, "  depends_on: {:?}", service.depends_on);
     let _ = writeln!(
         output,
@@ -948,6 +953,11 @@ fn append_action_detail(output: &mut String, name: &str, action: &ActionConfig) 
         format_optional_path(action.cwd.as_ref())
     );
     let _ = writeln!(output, "  env: {}", format_string_map(&action.env));
+    let _ = writeln!(
+        output,
+        "  resolved_env: {}",
+        format_resolved_env_map(&action.env)
+    );
     let _ = writeln!(
         output,
         "  timeout_secs: {}",
@@ -1026,11 +1036,28 @@ fn format_optional_path(path: Option<&PathBuf>) -> String {
         .unwrap_or_else(|| "none".to_owned())
 }
 
-fn format_string_map(values: &BTreeMap<String, String>) -> String {
+fn format_string_map(values: &BTreeMap<String, EnvValueConfig>) -> String {
     if values.is_empty() {
         "{}".to_owned()
     } else {
-        format!("{values:?}")
+        let rendered = values
+            .iter()
+            .map(|(key, value)| format!("{key}: {}", value.format_compact()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{{{rendered}}}")
+    }
+}
+
+fn format_resolved_env_map(values: &BTreeMap<String, EnvValueConfig>) -> String {
+    if values.is_empty() {
+        "{}".to_owned()
+    } else {
+        let resolved = values
+            .iter()
+            .map(|(key, value)| (key.clone(), value.render()))
+            .collect::<BTreeMap<_, _>>();
+        format!("{resolved:?}")
     }
 }
 
@@ -3879,6 +3906,9 @@ mod tests {
         assert!(raw.contains("watch:"));
         assert!(raw.contains("debounce_ms: 500"));
         assert!(raw.contains("env:"));
+        assert!(raw.contains("JAVA_TOOL_OPTIONS:"));
+        assert!(raw.contains("separator:"));
+        assert!(raw.contains("parts:"));
         assert!(raw.contains("./logs/app.log"));
         assert!(raw.contains("stop_signal:"));
         assert!(raw.contains("autostart: true"));
@@ -3941,6 +3971,10 @@ mod tests {
         assert!(output.contains("actions:"));
         assert!(output.contains("timeout_secs: 30"));
         assert!(output.contains("disabled: true"));
+        assert!(output.contains("JAVA_TOOL_OPTIONS"));
+        assert!(output.contains("separator: \" \""));
+        assert!(output.contains("resolved_env:"));
+        assert!(output.contains("-Done=true -Dtwo=false"));
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -5057,6 +5091,11 @@ services:
     cwd: .
     env:
       RUST_LOG: info
+      JAVA_TOOL_OPTIONS:
+        separator: " "
+        parts:
+          - "-Done=true"
+          - "-Dtwo=false"
     stop_timeout_secs: 15
     autostart: true
     log:

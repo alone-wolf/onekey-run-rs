@@ -30,6 +30,7 @@
 | `14_service_watch_tasks.md` | 将 `services.<name>.watch` 设计拆成可直接编码的任务清单、实施顺序、文件改动点与验收标准 | draft |
 | `15_tui_service_restart_tasks.md` | 将 TUI 中按 `R` 重启选中 service 的设计拆成可直接编码的任务清单、实施顺序、文件改动点与验收标准 | draft |
 | `16_tui_keep_mode_tasks.md` | 将 `up --tui --keep --manage` 的分层语义拆成可直接编码的任务清单，覆盖只读 post-run 与常驻控制台两条路径 | done |
+| `17_env_concat_phase1_tasks.md` | 将 `env` 分段拼接对象第一阶段设计拆成可直接编码的任务清单，覆盖 schema、校验、resolve、展示与测试 | draft |
 
 ## 规划阶段必须准备的文档
 
